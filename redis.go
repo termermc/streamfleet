@@ -2,17 +2,17 @@ package streamfleet
 
 import (
 	"crypto/tls"
-	"github.com/redis/go-redis/v9"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // Some parts of this file has been adapted from github.com/hibiken/asynq.
 // github.com/hibiken/asynq is licensed under the MIT license, the same license as this project.
 
 // ToRedisClient is a type that can be used to create a Redis client.
-// It can create either a standard Redis client or a clustered client.
-type ToRedisClient[T redis.Client | redis.ClusterClient] interface {
-	ToClient() *T
+type ToRedisClient interface {
+	ToClient() redis.UniversalClient
 }
 
 // RedisClientOpt is used to create a redis client that connects
@@ -66,7 +66,7 @@ type RedisClientOpt struct {
 	TLSConfig *tls.Config
 }
 
-func (opt RedisClientOpt) ToClient() *redis.Client {
+func (opt RedisClientOpt) ToClient() redis.UniversalClient {
 	return redis.NewClient(&redis.Options{
 		Network:      opt.Network,
 		Addr:         opt.Addr,
@@ -140,7 +140,7 @@ type RedisFailoverClientOpt struct {
 	TLSConfig *tls.Config
 }
 
-func (opt RedisFailoverClientOpt) ToClient() *redis.Client {
+func (opt RedisFailoverClientOpt) ToClient() redis.UniversalClient {
 	return redis.NewFailoverClient(&redis.FailoverOptions{
 		MasterName:       opt.MasterName,
 		SentinelAddrs:    opt.SentinelAddrs,
@@ -201,7 +201,7 @@ type RedisClusterClientOpt struct {
 	TLSConfig *tls.Config
 }
 
-func (opt RedisClusterClientOpt) ToClient() *redis.ClusterClient {
+func (opt RedisClusterClientOpt) ToClient() redis.UniversalClient {
 	return redis.NewClusterClient(&redis.ClusterOptions{
 		Addrs:        opt.Addrs,
 		MaxRedirects: opt.MaxRedirects,

@@ -10,9 +10,9 @@ const TaskMaxPendingTime = 1 * time.Minute
 // TaskUpdatePendingInterval is the interval at which the pending time of a task is updated.
 const TaskUpdatePendingInterval = 10 * time.Second
 
-// QueuePrefix is the prefix use for all Streamfleet work queues Redis stream keys.
-// The underlying stream key for a queue will be QueuePrefix + the queue's key.
-const QueuePrefix = "streamfleet:"
+// QueueStreamPrefix is the prefix use for all Streamfleet work queues Redis stream keys.
+// The underlying stream key for a queue will be QueueStreamPrefix + the queue's key.
+const QueueStreamPrefix = "streamfleet:"
 
 // Task is a task to be processed by a worker.
 // It is sent to the queue, and then processed by a worker.
