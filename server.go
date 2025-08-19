@@ -13,13 +13,6 @@ import (
 // TODO Figure out a good way to trim the stream.
 // Right now my strategy is to use XDEL on old entries, but that doesn't work for crashed clients, and there might be more caveats.
 
-type queuedTask struct {
-	Id     string
-	Stream string
-	Queue  string
-	Task   *Task
-}
-
 // The Redis stream group name used by servers to receive new messages.
 const serverGroupName = "streamfleet-server"
 
@@ -124,7 +117,7 @@ func (s *Server) Handle(queueKey string, handler TaskHandler) {
 	}
 
 	s.queueHandlers[queueKey] = handler
-	s.streamToQueue[QueueStreamPrefix+queueKey] = queueKey
+	s.streamToQueue[KeyPrefix+queueKey] = queueKey
 }
 
 func (s *Server) procLoop() {
@@ -135,6 +128,11 @@ func (s *Server) procLoop() {
 	for queued := range s.pendingTasks {
 		if !s.isRunning {
 			// TODO Mark task as canceled and log
+			continue
+		}
+
+		if queued.Task.ExpiresTs != nil && time.Now().After(*queued.Task.ExpiresTs) {
+			// TODO Send notification that the task has expired
 			continue
 		}
 
@@ -157,10 +155,10 @@ func (s *Server) procLoop() {
 		// Make sure the task is periodically claimed by this worker while it is in progress.
 		// This prevents other workers from thinking this server is dead and claiming the task for themselves.
 		go func() {
-			ticker := time.NewTicker(TaskUpdatePendingInterval)
+			timer := time.NewTimer(TaskUpdatePendingInterval)
 			for {
 				select {
-				case <-ticker.C:
+				case <-timer.C:
 					err := s.client.XClaim(ctx, &redis.XClaimArgs{
 						Stream:   queued.Stream,
 						Group:    serverGroupName,
@@ -171,6 +169,7 @@ func (s *Server) procLoop() {
 						// TODO Log error about failing to XCLAIM task
 					}
 				case <-handlerDone:
+					timer.Stop()
 					return
 				}
 			}

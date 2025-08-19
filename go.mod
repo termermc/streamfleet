@@ -5,6 +5,7 @@ go 1.24.6
 require (
 	github.com/puzpuzpuz/xsync/v4 v4.1.0
 	github.com/redis/go-redis/v9 v9.12.1
+	github.com/google/uuid v1.6.0
 )
 
 require (
