@@ -33,7 +33,7 @@ func prepareRedis(ctx context.Context) (cont testcontainers.Container, addr stri
 	return cont, "127.0.0.1:" + port, nil
 }
 
-func TestServer(t *testing.T) {
+func TestSimpleEnqueueAndForget(t *testing.T) {
 	ctx := context.Background()
 	cont, redisAddr, err := prepareRedis(ctx)
 	defer func() {
@@ -90,6 +90,76 @@ func TestServer(t *testing.T) {
 			finChan <- err
 		}
 	}()
+
+	err = <-finChan
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSimpleEnqueueAndTrack(t *testing.T) {
+	ctx := context.Background()
+	cont, redisAddr, err := prepareRedis(ctx)
+	defer func() {
+		// Give time for server and client to close.
+		time.Sleep(1 * time.Second)
+		_ = cont.Stop(context.Background(), nil)
+	}()
+
+	if err != nil {
+		t.Fatal(fmt.Errorf("failed to start Redis container: %w", err))
+	}
+
+	redisOpt := streamfleet.RedisClientOpt{
+		Addr: redisAddr,
+	}
+
+	client, err := streamfleet.NewClient(ctx, streamfleet.ClientOpt{
+		RedisOpt: redisOpt,
+	}, TestQueue1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = client.Close()
+	}()
+
+	handle, err := client.EnqueueAndTrack(TestQueue1, "hello", streamfleet.TaskOpt{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server, err := streamfleet.NewServer(streamfleet.ServerOpt{
+		ServerUniqueId: "test.localhost",
+		RedisOpt:       redisOpt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() {
+		_ = server.Close()
+	}()
+
+	finChan := make(chan error, 1)
+
+	server.Handle(TestQueue1, func(ctx context.Context, task *streamfleet.Task) error {
+		finChan <- nil
+		return nil
+	})
+
+	go func() {
+		err = server.Run()
+		if err != nil {
+			finChan <- err
+		}
+	}()
+
+	// Wait for task completion.
+	err = handle.Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	err = <-finChan
 	if err != nil {

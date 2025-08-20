@@ -2,8 +2,10 @@ package streamfleet
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/puzpuzpuz/xsync/v4"
@@ -190,10 +192,9 @@ func (c *Client) EnqueueAndForget(queueKey string, data string, opt TaskOpt) err
 		return ErrUnsupportedQueueKey
 	}
 
-	task := newTask(data, false, opt)
+	task := newTask(data, c.id, false, opt)
 
 	c.queuedTasks <- queuedTask{
-		Id:     task.Id,
 		Stream: KeyPrefix + queueKey,
 		Queue:  queueKey,
 		Task:   task,
@@ -216,14 +217,13 @@ func (c *Client) EnqueueAndTrack(queueKey string, data string, opt TaskOpt) (*Ta
 		return nil, ErrUnsupportedQueueKey
 	}
 
-	task := newTask(data, true, opt)
+	task := newTask(data, c.id, true, opt)
 	taskHandle := &TaskHandle{
 		Id:         task.Id,
 		resultChan: make(chan error, 1),
 	}
 	c.pendingTasks.Store(task.Id, taskHandle)
 	c.queuedTasks <- queuedTask{
-		Id:     task.Id,
 		Stream: stream,
 		Queue:  queueKey,
 		Task:   task,
@@ -311,24 +311,63 @@ func (c *Client) notifLoop() {
 	stream := mkRecvStreamKey(c.id)
 
 	for c.isRunning {
-		streamResults, err := c.client.XReadGroup(ctx, &redis.XReadGroupArgs{
-			Group:    clientGroupName,
-			Streams:  []string{stream, ">"},
-			Consumer: c.id,
-			Block:    0,
-			Count:    10,
-		}).Result()
-		if err != nil {
-			// TODO If this is due to the stream or group not existing, recreate it and try again.
+		skipIter := false
 
-			c.logger.Log(ctx, slog.LevelError, "failed to receive task notifications from Redis",
-				"service", "streamfleet.Client",
-				"error", err,
-			)
+		// Wrap XReadGroup in loop so that it can be repeated if the consumer group needs to be recreated.
+		var streamResults []redis.XStream
+		var err error
+		needsRetry := true
+		for needsRetry {
+			needsRetry = false
 
-			// Wait a second before trying again.
-			time.Sleep(1 * time.Second)
+			streamResults, err = c.client.XReadGroup(ctx, &redis.XReadGroupArgs{
+				Group:    clientGroupName,
+				Streams:  []string{stream, ">"},
+				Consumer: c.id,
+				Block:    0,
+				Count:    10,
+			}).Result()
+			if err != nil {
+				if !c.isRunning || errors.Is(err, redis.ErrClosed) {
+					break
+				}
 
+				// If this is due to the stream or group not existing, recreate it and try again.
+				if strings.Contains(err.Error(), "NOGROUP") {
+					err = c.client.XGroupCreateMkStream(ctx, stream, clientGroupName, "0").Err()
+					if err != nil {
+						c.logger.Log(ctx, slog.LevelError, "failed to recreate receiver for client",
+							"service", "streamfleet.Client",
+							"client_id", c.id,
+							"stream", stream,
+							"consumer_group", clientGroupName,
+							"error", err,
+						)
+
+						// Wait a second before trying again.
+						time.Sleep(1 * time.Second)
+
+						skipIter = true
+						break
+					}
+
+					needsRetry = true
+					continue
+				}
+
+				c.logger.Log(ctx, slog.LevelError, "failed to receive task notifications from Redis",
+					"service", "streamfleet.Client",
+					"error", err,
+				)
+
+				// Wait a second before trying again.
+				time.Sleep(1 * time.Second)
+				skipIter = true
+				break
+			}
+		}
+
+		if skipIter {
 			continue
 		}
 
@@ -406,16 +445,16 @@ func (c *Client) Close() error {
 		return true
 	})
 
-	// Delete receiver consumer group and stream.
+	// Delete receiver stream and consumer group.
 	ctx := context.Background()
 	recvKey := mkRecvStreamKey(c.id)
-	err := c.client.XGroupDestroy(ctx, recvKey, clientGroupName).Err()
-	if err != nil {
-		return fmt.Errorf(`streamfleet: failed to delete receiver consumer group %s for stream %s while closing client with ID %s: %w`, clientGroupName, recvKey, c.id, err)
-	}
-	err = c.client.Del(ctx, recvKey).Err()
+	err := c.client.Del(ctx, recvKey).Err()
 	if err != nil {
 		return fmt.Errorf(`streamfleet: failed to delete receiver stream %s while closing client with ID %s: %w`, recvKey, c.id, err)
+	}
+	err = c.client.XGroupDestroy(ctx, recvKey, clientGroupName).Err()
+	if err != nil {
+		return fmt.Errorf(`streamfleet: failed to delete receiver consumer group %s for stream %s while closing client with ID %s: %w`, clientGroupName, recvKey, c.id, err)
 	}
 
 	// Delete heartbeat entries.

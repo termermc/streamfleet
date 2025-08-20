@@ -79,7 +79,7 @@ type Server struct {
 
 	// Pending tasks to be picked up by worker goroutines.
 	// Its capacity must match ServerOpt.HandlerConcurrency.
-	pendingTasks chan queuedTask
+	pendingTasks chan *queuedTask
 
 	// Channel written to for each task processing loop that has exited.
 	finishedChan chan struct{}
@@ -121,7 +121,7 @@ func NewServer(opt ServerOpt) (*Server, error) {
 		streamToQueue: make(map[string]string),
 		queueHandlers: make(map[string]TaskHandler),
 		client:        client,
-		pendingTasks:  make(chan queuedTask, opt.HandlerConcurrency),
+		pendingTasks:  make(chan *queuedTask, opt.HandlerConcurrency),
 		finishedChan:  make(chan struct{}, opt.HandlerConcurrency),
 		inProgress:    xsync.NewMap[string, context.CancelFunc](),
 		logger:        logger,
@@ -146,19 +146,56 @@ func (s *Server) Handle(queueKey string, handler TaskHandler) {
 	s.streamToQueue[KeyPrefix+queueKey] = queueKey
 }
 
+// sendTaskNotif sends a task notification.
+// It logs an error if it fails rather than returning an error.
+func (s *Server) sendTaskNotif(clientId string, notif TaskNotification) {
+	ctx := context.Background()
+
+	stream := mkRecvStreamKey(clientId)
+	err := s.client.XAdd(ctx, &redis.XAddArgs{
+		Stream: stream,
+		Values: notif.encode(),
+	}).Err()
+	if err != nil {
+		s.logger.Log(ctx, slog.LevelError, "failed to send task notification",
+			"service", "streamfleet.Server",
+			"task_client_id", clientId,
+			"task_id", notif.TaskId,
+			"task_notification_type", notif.Type,
+			"error", err,
+		)
+	}
+}
+
 func (s *Server) procLoop() {
 	defer func() {
 		s.finishedChan <- struct{}{}
 	}()
 
 	for queued := range s.pendingTasks {
+		task := queued.Task
+
 		if !s.isRunning {
-			// TODO Mark task as canceled and log
+			s.logger.Log(context.Background(), slog.LevelDebug, "canceling pending task because server is closed",
+				"service", "streamfleet.Server",
+				"task_id", task.Id,
+			)
+			if task.sendNotifications {
+				s.sendTaskNotif(task.ClientId, TaskNotification{
+					TaskId: task.Id,
+					Type:   TaskNotificationTypeCanceled,
+				})
+			}
 			continue
 		}
 
 		if queued.Task.ExpiresTs != nil && time.Now().After(*queued.Task.ExpiresTs) {
-			// TODO Send notification that the task has expired
+			if task.sendNotifications {
+				s.sendTaskNotif(queued.Task.ClientId, TaskNotification{
+					TaskId: queued.Task.Id,
+					Type:   TaskNotificationTypeExpired,
+				})
+			}
 			continue
 		}
 
@@ -175,10 +212,10 @@ func (s *Server) procLoop() {
 		ctx, cancel := context.WithCancel(context.Background())
 		cleanup := func() {
 			cancel()
-			s.inProgress.Delete(queued.Id)
+			s.inProgress.Delete(queued.Task.Id)
 		}
 
-		s.inProgress.Store(queued.Id, cancel)
+		s.inProgress.Store(queued.Task.Id, cancel)
 
 		handlerDone := make(chan struct{})
 
@@ -193,7 +230,7 @@ func (s *Server) procLoop() {
 						Stream:   queued.Stream,
 						Group:    serverGroupName,
 						Consumer: s.opt.ServerUniqueId,
-						Messages: []string{queued.Id},
+						Messages: []string{queued.RedisId},
 					}).Err()
 					if err != nil && !errors.Is(err, context.Canceled) {
 						s.logger.Log(ctx, slog.LevelError, "failed to keep task in server custody with XCLAIM",
@@ -227,7 +264,7 @@ func (s *Server) procLoop() {
 					"will_retry", true,
 				)
 
-				// TODO Re-queue
+				// TODO Re-queue and update queuedTask.RedisId
 			} else {
 				s.logger.Log(ctx, slog.LevelError, "task handler returned error, will not retry",
 					"service", "streamfleet.Server",
@@ -238,12 +275,26 @@ func (s *Server) procLoop() {
 					"max_retries", queued.Task.MaxRetries,
 					"will_retry", false,
 				)
+
+				if task.sendNotifications {
+					// Since there are no retries left, fail task with error.
+					s.sendTaskNotif(task.ClientId, TaskNotification{
+						TaskId: task.Id,
+						Type:   TaskNotificationTypeError,
+						ErrMsg: err.Error(),
+					})
+				}
 			}
+		} else if task.sendNotifications {
+			s.sendTaskNotif(task.ClientId, TaskNotification{
+				TaskId: task.Id,
+				Type:   TaskNotificationTypeCompleted,
+			})
 		}
 
 		// Regardless of whether the handler exited with success or failure, acknowledge the message.
 		// If it failed, it should have already had a duplicate added by this point.
-		err = s.client.XAck(context.Background(), queued.Stream, serverGroupName, queued.Id).Err()
+		err = s.client.XAck(context.Background(), queued.Stream, serverGroupName, queued.RedisId).Err()
 		if err != nil {
 			s.logger.Log(ctx, slog.LevelError, "failed to acknowledge handled task",
 				"service", "streamfleet.Server",
@@ -257,7 +308,7 @@ func (s *Server) procLoop() {
 		}
 
 		// TODO Replace delete with trim?
-		err = s.client.XDel(context.Background(), queued.Stream, queued.Id).Err()
+		err = s.client.XDel(context.Background(), queued.Stream, queued.RedisId).Err()
 		if err != nil {
 			s.logger.Log(ctx, slog.LevelError, "failed to delete handled task",
 				"service", "streamfleet.Server",
@@ -329,11 +380,11 @@ func (s *Server) recvLoop() error {
 					continue
 				}
 
-				s.pendingTasks <- queuedTask{
-					Id:     msg.ID,
-					Stream: result.Stream,
-					Queue:  queue,
-					Task:   task,
+				s.pendingTasks <- &queuedTask{
+					Stream:  result.Stream,
+					Queue:   queue,
+					Task:    task,
+					RedisId: msg.ID,
 				}
 			}
 		}

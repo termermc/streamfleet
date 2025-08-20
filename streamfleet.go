@@ -50,6 +50,9 @@ type Task struct {
 	// The message's unique ID.
 	Id string
 
+	// The ID of the client where the task originated.
+	ClientId string
+
 	// The task's underlying data.
 	// Required, but technically can be nil/empty.
 	Data string
@@ -92,9 +95,10 @@ type TaskOpt struct {
 	RetryDelay time.Duration
 }
 
-func newTask(data string, sendNotif bool, opt TaskOpt) *Task {
+func newTask(data string, clientId string, sendNotif bool, opt TaskOpt) *Task {
 	return &Task{
 		Id:                MustUuidV7(),
+		ClientId:          clientId,
 		Data:              data,
 		MaxRetries:        opt.MaxRetries,
 		ExpiresTs:         opt.ExpiresTs,
@@ -113,6 +117,7 @@ func (t *Task) encode() map[string]any {
 	return map[string]any{
 		"enc_version": curTaskEncVer,
 		"id":          t.Id,
+		"client_id":   t.ClientId,
 		"data":        t.Data,
 		"max_retries": t.MaxRetries,
 		"expires_ts":  expTs,
@@ -144,6 +149,7 @@ func decodeTask(msg map[string]any) (*Task, error) {
 	switch verInt {
 	case 1:
 		fieldId := msg["id"].(string)
+		fieldClientId := msg["client_id"].(string)
 		fieldData := msg["data"].(string)
 		fieldMaxRetriesStr := msg["max_retries"].(string)
 		fieldExpiresTsStr := msg["expires_ts"].(string)
@@ -164,6 +170,7 @@ func decodeTask(msg map[string]any) (*Task, error) {
 
 		return &Task{
 			Id:                fieldId,
+			ClientId:          fieldClientId,
 			Data:              fieldData,
 			MaxRetries:        int(fieldMaxRetries),
 			ExpiresTs:         expiresTs,
@@ -209,11 +216,10 @@ func (t *TaskHandle) Wait() error {
 }
 
 type queuedTask struct {
-	// TODO Should the Id field in here be removed in favor of using Task.Id?
-	Id     string
-	Stream string
-	Queue  string
-	Task   *Task
+	Stream  string
+	Queue   string
+	Task    *Task
+	RedisId string
 }
 
 func mkRecvHeartbeatKey(queueKey string) string {
@@ -316,7 +322,7 @@ func (t *TaskNotification) encode() map[string]any {
 	return map[string]any{
 		"enc_version": curTaskNotifEncVer,
 		"task_id":     t.TaskId,
-		"type":        t.Type,
+		"type":        string(t.Type),
 		"err_msg":     t.ErrMsg,
 	}
 }
