@@ -11,10 +11,10 @@ import (
 )
 
 // The current encoding version used for encoding tasks in Redis stream messages.
-const curTaskEncVer = 1
+const curTaskEncVer = "1"
 
 // The current encoding version used for encoding task notifications in Redis stream messages.
-const curTaskNotifEncVer = 1
+const curTaskNotifEncVer = "1"
 
 // TaskMaxPendingTime is the maximum time a task can sit in a worker's pending list before it is reclaimable by other workers.
 // Tasks pending time is updated by healthy clients at the interval specified by TaskUpdatePendingInterval.
@@ -27,6 +27,9 @@ const TaskUpdatePendingInterval = 10 * time.Second
 // KeyPrefix is the prefix used by Streamfleet for all Redis keys, including work queue streams.
 // The underlying stream key for a queue will be KeyPrefix + the queue's key.
 const KeyPrefix = "streamfleet:"
+
+// ErrNoQueues is returned when running a server or instantiating a client without specifying any queue keys.
+var ErrNoQueues = fmt.Errorf("streamfleet: tried to run a server or instantiate a client that had no configured queue keys")
 
 // ErrTaskCanceled is returned when a task has been canceled.
 var ErrTaskCanceled = fmt.Errorf("streamfleet: task canceled")
@@ -49,7 +52,7 @@ type Task struct {
 
 	// The task's underlying data.
 	// Required, but technically can be nil/empty.
-	Data []byte
+	Data string
 
 	// The task's maximum retry count.
 	// If a task is retried more than this many times, it will be removed from the queue, and optionally send a canceled signal.
@@ -89,7 +92,7 @@ type TaskOpt struct {
 	RetryDelay time.Duration
 }
 
-func newTask(data []byte, sendNotif bool, opt TaskOpt) *Task {
+func newTask(data string, sendNotif bool, opt TaskOpt) *Task {
 	return &Task{
 		Id:                MustUuidV7(),
 		Data:              data,
@@ -119,34 +122,39 @@ func (t *Task) encode() map[string]any {
 	}
 }
 
-// ErrMissingOrMalformedTaskVersion is returned when the version field of an encoded task from a Redis stream is missing or malformed.
-var ErrMissingOrMalformedTaskVersion = errors.New("streamfleet: missing or malformed enc_version in encoded task")
+// ErrMissingOrMalformedEncodingVersion is returned when the version field of an encoded message from a Redis stream is missing or malformed.
+var ErrMissingOrMalformedEncodingVersion = errors.New("streamfleet: missing or malformed enc_version in encoded message")
 
 // ErrUnsupportedEncodingVersion is returned when the version field of an encoded message from a Redis stream is unsupported.
 var ErrUnsupportedEncodingVersion = errors.New("streamfleet: unsupported enc_version in encoded message, this node may be running an outdated version of Streamfleet")
 
 // decodeTask decodes a task from a raw Redis stream message.
-// Returns ErrMissingOrMalformedTaskVersion if the version field is missing or malformed.
+// Returns ErrMissingOrMalformedEncodingVersion if the version field is missing or malformed.
 // Returns ErrUnsupportedEncodingVersion if the version field is unsupported.
 func decodeTask(msg map[string]any) (*Task, error) {
 	verAny, ok := msg["enc_version"]
 	if !ok || verAny == nil {
-		return nil, ErrMissingOrMalformedTaskVersion
+		return nil, ErrMissingOrMalformedEncodingVersion
 	}
-	verInt, ok := verAny.(int)
-	if !ok {
-		return nil, ErrMissingOrMalformedTaskVersion
+	verInt, err := strconv.ParseInt(verAny.(string), 10, 64)
+	if err != nil {
+		return nil, ErrMissingOrMalformedEncodingVersion
 	}
 
 	switch verInt {
 	case 1:
 		fieldId := msg["id"].(string)
-		fieldData := msg["data"].([]byte)
-		fieldMaxRetries := msg["max_retries"].(int)
-		fieldExpiresTs := msg["expires_ts"].(int64)
-		fieldRetryDelay := msg["retry_delay"].(int64)
-		fieldSendNotif := msg["send_notif"].(bool)
-		fieldRetries := msg["retries"].(int)
+		fieldData := msg["data"].(string)
+		fieldMaxRetriesStr := msg["max_retries"].(string)
+		fieldExpiresTsStr := msg["expires_ts"].(string)
+		fieldRetryDelayStr := msg["retry_delay"].(string)
+		fieldSendNotif := msg["send_notif"] != "0"
+		fieldRetriesStr := msg["retries"].(string)
+
+		fieldMaxRetries, _ := strconv.ParseInt(fieldMaxRetriesStr, 10, 64)
+		fieldExpiresTs, _ := strconv.ParseInt(fieldExpiresTsStr, 10, 64)
+		fieldRetryDelay, _ := strconv.ParseInt(fieldRetryDelayStr, 10, 64)
+		fieldRetries, _ := strconv.ParseInt(fieldRetriesStr, 10, 64)
 
 		var expiresTs *time.Time
 		if fieldExpiresTs != 0 {
@@ -157,11 +165,11 @@ func decodeTask(msg map[string]any) (*Task, error) {
 		return &Task{
 			Id:                fieldId,
 			Data:              fieldData,
-			MaxRetries:        fieldMaxRetries,
+			MaxRetries:        int(fieldMaxRetries),
 			ExpiresTs:         expiresTs,
 			RetryDelay:        time.Duration(fieldRetryDelay) * time.Millisecond,
 			sendNotifications: fieldSendNotif,
-			retries:           fieldRetries,
+			retries:           int(fieldRetries),
 		}, nil
 	default:
 		return nil, ErrUnsupportedEncodingVersion
@@ -314,16 +322,16 @@ func (t *TaskNotification) encode() map[string]any {
 }
 
 // decodeTaskNotification decodes a task notification from a raw Redis stream message.
-// Returns ErrMissingOrMalformedTaskVersion if the version field is missing or malformed.
+// Returns ErrMissingOrMalformedEncodingVersion if the version field is missing or malformed.
 // Returns ErrUnsupportedEncodingVersion if the version field is unsupported.
 func decodeTaskNotification(msg map[string]any) (*TaskNotification, error) {
 	verAny, ok := msg["enc_version"]
 	if !ok || verAny == nil {
-		return nil, ErrMissingOrMalformedTaskVersion
+		return nil, ErrMissingOrMalformedEncodingVersion
 	}
-	verInt, ok := verAny.(int)
-	if !ok {
-		return nil, ErrMissingOrMalformedTaskVersion
+	verInt, err := strconv.ParseInt(verAny.(string), 10, 64)
+	if err != nil {
+		return nil, ErrMissingOrMalformedEncodingVersion
 	}
 
 	switch verInt {

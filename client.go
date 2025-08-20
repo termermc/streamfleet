@@ -32,6 +32,7 @@ type ClientOpt struct {
 
 	// The timeout to use for reconnections to Redis in the event disconnection.
 	// If unspecified, there is no timeout and the server will attempt to reconnect forever.
+	// TODO Check if this is needed
 	RetryTimeout time.Duration
 
 	// The maximum number of tasks to queue locally in-memory while waiting for Redis to come back online.
@@ -72,15 +73,12 @@ type Client struct {
 	logger *slog.Logger
 }
 
-// ErrNoClientQueueKeys is returned when calling NewClient without specifying any queue keys for the client.
-var ErrNoClientQueueKeys = fmt.Errorf("streamfleet: no queue keys were specified when calling NewClient")
-
 // NewClient creates a new client instance.
 // The list of queue keys to support for this client must be exhaustive and cannot change without creating a new client.
-// Returns ErrNoClientQueueKeys if no queue keys were specified.
+// Returns ErrNoQueues if no queue keys were specified.
 func NewClient(ctx context.Context, opt ClientOpt, queueKeys ...string) (*Client, error) {
 	if len(queueKeys) == 0 {
-		return nil, ErrNoClientQueueKeys
+		return nil, ErrNoQueues
 	}
 
 	id := MustUuidV7()
@@ -126,6 +124,8 @@ func NewClient(ctx context.Context, opt ClientOpt, queueKeys ...string) (*Client
 	}
 
 	go c.heartbeatLoop()
+	go c.enqueueLoop()
+	go c.notifLoop()
 
 	return c, nil
 }
@@ -181,7 +181,7 @@ var ErrUnsupportedQueueKey = fmt.Errorf(`streamfleet: unsupported queue key, cli
 // EnqueueAndForget adds a task to the queue and immediately returns.
 // Errors in queuing or the status of the task once it is picked up by a server are not tracked.
 // If you need to know when the task has been completed, use EnqueueAndTrack.
-func (c *Client) EnqueueAndForget(queueKey string, data []byte, opt TaskOpt) error {
+func (c *Client) EnqueueAndForget(queueKey string, data string, opt TaskOpt) error {
 	if !c.isRunning {
 		panic(fmt.Sprintf("streamfleet: tried to queue task on closed server (queueKey: %s)", queueKey))
 	}
@@ -206,7 +206,7 @@ func (c *Client) EnqueueAndForget(queueKey string, data []byte, opt TaskOpt) err
 // Errors in queuing or the status of the task once it is picked up by the server can be tracked using the returned handle.
 // If you do not need to know when the task has been completed, use EnqueueAndForget.
 // You should only use this method if you need to know the status of the task, as it is less efficient than EnqueueAndForget.
-func (c *Client) EnqueueAndTrack(queueKey string, data []byte, opt TaskOpt) (*TaskHandle, error) {
+func (c *Client) EnqueueAndTrack(queueKey string, data string, opt TaskOpt) (*TaskHandle, error) {
 	if !c.isRunning {
 		panic(fmt.Sprintf("streamfleet: tried to queue task on closed server (queueKey: %s)", queueKey))
 	}
@@ -267,7 +267,7 @@ func (c *Client) enqueueLoop() {
 			}
 		}
 
-		if queued.Task.ExpiresTs.After(time.Now()) {
+		if queued.Task.ExpiresTs != nil && queued.Task.ExpiresTs.After(time.Now()) {
 			if hasP {
 				pending.resultChan <- ErrTaskExpired
 			}
@@ -288,9 +288,9 @@ func (c *Client) enqueueLoop() {
 			// TODO Should I use MAXLEN here?
 			// What other options are needed?
 			// Consult Redis docs.
-		})
+		}).Err()
 		if err != nil {
-			c.logger.Log(ctx, slog.LevelError, "failed to sent locally queued task to Redis",
+			c.logger.Log(ctx, slog.LevelError, "failed to send locally queued task to Redis",
 				"service", "streamfleet.Client",
 				"task_id", queued.Task.Id,
 				"error", err,
@@ -313,7 +313,7 @@ func (c *Client) notifLoop() {
 	for c.isRunning {
 		streamResults, err := c.client.XReadGroup(ctx, &redis.XReadGroupArgs{
 			Group:    clientGroupName,
-			Streams:  []string{stream},
+			Streams:  []string{stream, ">"},
 			Consumer: c.id,
 			Block:    0,
 			Count:    10,
@@ -415,7 +415,7 @@ func (c *Client) Close() error {
 	}
 	err = c.client.Del(ctx, recvKey).Err()
 	if err != nil {
-		return fmt.Errorf(`streamfleet: failed to delete receiver stream %s while closing client with ID %s: %w`, stream, c.id, err)
+		return fmt.Errorf(`streamfleet: failed to delete receiver stream %s while closing client with ID %s: %w`, recvKey, c.id, err)
 	}
 
 	// Delete heartbeat entries.

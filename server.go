@@ -27,6 +27,9 @@ type TaskHandler func(ctx context.Context, task *Task) error
 // ErrMissingServerUniqueId is returned when a server is instantiated without a unique ID.
 var ErrMissingServerUniqueId = fmt.Errorf("streamfleet: server unique ID is missing")
 
+// ErrMissingRedisOpt is returned when a server is instantiated without the necessary options to construct a Redis client.
+var ErrMissingRedisOpt = fmt.Errorf("streamfleet: Redis client options are missing")
+
 // ServerOpt are options for Streamfleet servers.
 type ServerOpt struct {
 	// The unique identifier of the server.
@@ -91,7 +94,14 @@ type Server struct {
 
 // NewServer creates a new server instance.
 // It does not connect to Redis until Server.Run is called.
-func NewServer(opt ServerOpt) *Server {
+func NewServer(opt ServerOpt) (*Server, error) {
+	if opt.ServerUniqueId == "" {
+		return nil, ErrMissingServerUniqueId
+	}
+	if opt.RedisOpt == nil {
+		return nil, ErrMissingRedisOpt
+	}
+
 	client := opt.RedisOpt.ToClient()
 
 	if opt.HandlerConcurrency < 1 {
@@ -121,7 +131,7 @@ func NewServer(opt ServerOpt) *Server {
 		go s.procLoop()
 	}
 
-	return s
+	return s, nil
 }
 
 // Handle sets the handler for the queue with the specified key.
@@ -271,9 +281,9 @@ func (s *Server) recvLoop() error {
 	ctx := context.Background()
 
 	for s.isRunning {
-		streams := make([]string, 0, len(s.streamToQueue))
+		streams := make([]string, 0, len(s.streamToQueue)*2)
 		for stream := range s.streamToQueue {
-			streams = append(streams, stream)
+			streams = append(streams, stream, ">")
 		}
 
 		streamResults, err := s.client.XReadGroup(ctx, &redis.XReadGroupArgs{
@@ -284,6 +294,10 @@ func (s *Server) recvLoop() error {
 			Count:    int64(s.opt.HandlerConcurrency),
 		}).Result()
 		if err != nil {
+			if !s.isRunning || errors.Is(err, redis.ErrClosed) {
+				break
+			}
+
 			// TODO Figure out if error can be ignored
 			return fmt.Errorf("streamfleet: server failed to read from Redis stream %s: %w", streamResults, err)
 		}
@@ -334,6 +348,10 @@ func (s *Server) recvLoop() error {
 func (s *Server) Run() error {
 	ctx := context.Background()
 
+	if len(s.streamToQueue) == 0 {
+		return ErrNoQueues
+	}
+
 	for stream := range s.streamToQueue {
 		err := s.client.XGroupCreateMkStream(ctx, stream, serverGroupName, "0").Err()
 		if err != nil {
@@ -341,6 +359,8 @@ func (s *Server) Run() error {
 			return fmt.Errorf("streamfleet: failed to create stream %s or group %s for the stream: %w", stream, serverGroupName, err)
 		}
 	}
+
+	s.isRunning = true
 
 	for s.isRunning {
 		err := s.recvLoop()
