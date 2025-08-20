@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/puzpuzpuz/xsync/v4"
 	"log/slog"
+	"net"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -152,19 +153,38 @@ func (s *Server) sendTaskNotif(clientId string, notif TaskNotification) {
 	ctx := context.Background()
 
 	stream := mkRecvStreamKey(clientId)
-	err := s.client.XAdd(ctx, &redis.XAddArgs{
-		Stream: stream,
-		Values: notif.encode(),
-	}).Err()
-	if err != nil {
-		s.logger.Log(ctx, slog.LevelError, "failed to send task notification",
-			"service", "streamfleet.Server",
-			"server_id", s.opt.ServerUniqueId,
-			"task_client_id", clientId,
-			"task_id", notif.TaskId,
-			"task_notification_type", notif.Type,
-			"error", err,
-		)
+
+	for s.isRunning {
+		err := s.client.XAdd(ctx, &redis.XAddArgs{
+			Stream: stream,
+			Values: notif.encode(),
+		}).Err()
+		if err != nil {
+			// Retry if it's due to a network error.
+			var opErr *net.OpError
+			if errors.As(err, &opErr) {
+				s.logger.Log(ctx, slog.LevelWarn, "failed to send task notification due to network error, will retry",
+					"service", "streamfleet.Server",
+					"server_id", s.opt.ServerUniqueId,
+					"task_id", notif.TaskId,
+					"error", err,
+				)
+				time.Sleep(1 * time.Second)
+				continue
+			}
+
+			s.logger.Log(ctx, slog.LevelError, "failed to send task notification",
+				"service", "streamfleet.Server",
+				"server_id", s.opt.ServerUniqueId,
+				"task_client_id", clientId,
+				"task_id", notif.TaskId,
+				"task_notification_type", notif.Type,
+				"error", err,
+			)
+			break
+		}
+
+		break
 	}
 }
 
@@ -330,18 +350,40 @@ func (s *Server) procLoop() {
 			})
 		}
 
-		// Regardless of whether the handler exited with success or failure, acknowledge the message.
-		// If it failed, it should have already had a duplicate added by this point.
-		err = s.client.XAck(context.Background(), queued.Stream, serverGroupName, queued.RedisId).Err()
-		if err != nil {
-			s.logger.Log(ctx, slog.LevelError, "failed to acknowledge handled task",
-				"service", "streamfleet.Server",
-				"server_id", s.opt.ServerUniqueId,
-				"task_id", queued.Task.Id,
-				"error", err,
-			)
+		skipIter := false
+		for s.isRunning {
+			// Regardless of whether the handler exited with success or failure, acknowledge the message.
+			// If it failed, it should have already had a duplicate added by this point.
+			err = s.client.XAck(context.Background(), queued.Stream, serverGroupName, queued.RedisId).Err()
+			if err != nil {
+				// Retry if it's due to a network error.
+				var opErr *net.OpError
+				if errors.As(err, &opErr) {
+					s.logger.Log(ctx, slog.LevelWarn, "failed to acknowledge handled task due to network error, will retry",
+						"service", "streamfleet.Server",
+						"server_id", s.opt.ServerUniqueId,
+						"task_id", queued.Task.Id,
+						"error", err,
+					)
+					time.Sleep(1 * time.Second)
+					continue
+				}
 
-			cleanup()
+				s.logger.Log(ctx, slog.LevelError, "failed to acknowledge handled task",
+					"service", "streamfleet.Server",
+					"server_id", s.opt.ServerUniqueId,
+					"task_id", queued.Task.Id,
+					"error", err,
+				)
+
+				cleanup()
+				skipIter = true
+				break
+			}
+
+			break
+		}
+		if skipIter {
 			continue
 		}
 

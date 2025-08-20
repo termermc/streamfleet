@@ -569,3 +569,72 @@ func TestDelayedServerStart(t *testing.T) {
 	default:
 	}
 }
+
+func TestRedisDisconnect(t *testing.T) {
+	d, err := mkDeps()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	const taskSleep = 1 * time.Second
+	const taskCount = 10
+
+	handles := make([]*streamfleet.TaskHandle, taskCount)
+	for i := range handles {
+		expTime := time.Now().Add(20 * time.Second)
+		handle, err := d.Client.EnqueueAndTrack(TestQueue1, "task"+strconv.FormatInt(int64(i), 10), streamfleet.TaskOpt{
+			ExpiresTs: &expTime,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		handles[i] = handle
+	}
+
+	finChan := make(chan error, 1)
+
+	handleCount := 0
+	d.Server.Handle(TestQueue1, func(ctx context.Context, task *streamfleet.Task) error {
+		time.Sleep(taskSleep)
+		handleCount++
+		return nil
+	})
+
+	go func() {
+		err = d.Server.Run()
+		if err != nil {
+			finChan <- err
+		}
+	}()
+
+	time.Sleep(1_500 * time.Millisecond)
+
+	if handleCount != 1 {
+		t.Errorf(`expected to get 1 task done in 1.5 seconds`)
+	}
+
+	err = d.Container.Stop(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1 * time.Second)
+	err = d.Container.Start(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for task completions.
+	for _, handle := range handles {
+		err = handle.Wait()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	select {
+	case err = <-finChan:
+		t.Fatal(err)
+	default:
+	}
+}
