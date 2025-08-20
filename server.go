@@ -159,12 +159,50 @@ func (s *Server) sendTaskNotif(clientId string, notif TaskNotification) {
 	if err != nil {
 		s.logger.Log(ctx, slog.LevelError, "failed to send task notification",
 			"service", "streamfleet.Server",
+			"server_id", s.opt.ServerUniqueId,
 			"task_client_id", clientId,
 			"task_id", notif.TaskId,
 			"task_notification_type", notif.Type,
 			"error", err,
 		)
 	}
+}
+
+func (s *Server) retry(ctx context.Context, queued *queuedTask, cause error) {
+	go func() {
+		task := queued.Task
+
+		time.Sleep(task.RetryDelay)
+
+		task.retries++
+		res, err := s.client.XAdd(ctx, &redis.XAddArgs{
+			Stream: queued.Stream,
+			Values: queued.Task.encode(),
+		}).Result()
+		if err != nil {
+			s.logger.Log(ctx, slog.LevelError, "failed to re-queue task after handler error",
+				"service", "streamfleet.Server",
+				"server_id", s.opt.ServerUniqueId,
+				"task_id", task.Id,
+				"stream", queued.Stream,
+				"error", err,
+			)
+
+			if task.sendNotifications {
+				// Send error notification with cause error.
+				s.sendTaskNotif(task.ClientId, TaskNotification{
+					TaskId: task.Id,
+					Type:   TaskNotificationTypeError,
+					ErrMsg: cause.Error(),
+				})
+			}
+
+			// TODO Introduce local holding queue if re-queue on Redis fails.
+			// This is because if Redis is down, there may be cascading failures in handlers, and we don't want to burn all retries.
+		}
+
+		queued.RedisId = res
+	}()
 }
 
 func (s *Server) procLoop() {
@@ -178,6 +216,7 @@ func (s *Server) procLoop() {
 		if !s.isRunning {
 			s.logger.Log(context.Background(), slog.LevelDebug, "canceling pending task because server is closed",
 				"service", "streamfleet.Server",
+				"server_id", s.opt.ServerUniqueId,
 				"task_id", task.Id,
 			)
 			if task.sendNotifications {
@@ -251,8 +290,6 @@ func (s *Server) procLoop() {
 		err := handler(ctx, queued.Task)
 		handlerDone <- struct{}{}
 		if err != nil {
-			// TODO Regardless of whether this was due to cancelation, abide by the retry policy.
-
 			if queued.Task.MaxRetries == 0 || queued.Task.retries < queued.Task.MaxRetries {
 				s.logger.Log(ctx, slog.LevelError, "task handler returned error, will retry",
 					"service", "streamfleet.Server",
@@ -264,7 +301,8 @@ func (s *Server) procLoop() {
 					"will_retry", true,
 				)
 
-				// TODO Re-queue and update queuedTask.RedisId
+				// Try to re-queue.
+				s.retry(ctx, queued, err)
 			} else {
 				s.logger.Log(ctx, slog.LevelError, "task handler returned error, will not retry",
 					"service", "streamfleet.Server",
