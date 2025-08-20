@@ -3,6 +3,7 @@ package streamfleet
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/puzpuzpuz/xsync/v4"
@@ -10,10 +11,16 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// TODO Periodically run GC
+
 // TODO On the client side, enforce expiration for tracked tasks.
 // This means pending tasks should be failed with an expired error if a reply has not been received.
 
-const clientGroupName = "receiver"
+// ErrClientQueueFull is returned when the client's queue is full.
+// This can be returned when enqueuing tasks, or be the logged error when a task is trying to be re-queued after an error.
+var ErrClientQueueFull = fmt.Errorf(`streamfleet: client queue is full, tasks are being enqueued too quickly to send to Redis, or Redis is unreachable`)
+
+const clientGroupName = "streamfleet-client"
 
 // ClientOpt are options for Streamfleet clients.
 type ClientOpt struct {
@@ -29,10 +36,12 @@ type ClientOpt struct {
 
 	// The maximum number of tasks to queue locally in-memory while waiting for Redis to come back online.
 	// After the local queue has filled up, new tasks being queued will result in an error.
-	// Defaults to 10.
+	// Defaults to 25.
 	MaxLocalQueueSize int
 
-	// TODO Pluggable logger
+	// The logger to use.
+	// If omitted, uses slog.Default.
+	logger *slog.Logger
 }
 
 // Client is a work queue client.
@@ -58,6 +67,9 @@ type Client struct {
 
 	// A mapping of task IDs to their corresponding handles.
 	pendingTasks *xsync.Map[string, *TaskHandle]
+
+	// The logger to use.
+	logger *slog.Logger
 }
 
 // ErrNoClientQueueKeys is returned when calling NewClient without specifying any queue keys for the client.
@@ -81,7 +93,14 @@ func NewClient(ctx context.Context, opt ClientOpt, queueKeys ...string) (*Client
 	}
 
 	if opt.MaxLocalQueueSize < 1 {
-		opt.MaxLocalQueueSize = 10
+		opt.MaxLocalQueueSize = 25
+	}
+
+	var logger *slog.Logger
+	if opt.logger == nil {
+		logger = slog.Default()
+	} else {
+		logger = opt.logger
 	}
 
 	c := &Client{
@@ -92,6 +111,7 @@ func NewClient(ctx context.Context, opt ClientOpt, queueKeys ...string) (*Client
 		client:        client,
 		queuedTasks:   make(chan queuedTask, opt.MaxLocalQueueSize),
 		pendingTasks:  xsync.NewMap[string, *TaskHandle](),
+		logger:        logger,
 	}
 
 	// Create stream and consumer group.
@@ -135,9 +155,23 @@ func (c *Client) heartbeatLoop() {
 		}
 
 		if err := c.doHeartbeat(ctx); err != nil {
-			// TODO Log error
+			c.logger.Log(ctx, slog.LevelError, "failed to do client heartbeat",
+				"service", "streamfleet.Client",
+				"error", err,
+			)
 			continue
 		}
+	}
+}
+
+// tryQueue tries putting a task on the local queue.
+// If the queue is full, returns false. Otherwise, the task was queued and returns true.
+func (c *Client) tryQueue(q queuedTask) bool {
+	select {
+	case c.queuedTasks <- q:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -199,21 +233,37 @@ func (c *Client) EnqueueAndTrack(queueKey string, data []byte, opt TaskOpt) (*Ta
 }
 
 func (c *Client) enqueueLoop() {
+	ctx := context.Background()
+
 	for queued := range c.queuedTasks {
+		pending, hasP := c.pendingTasks.Load(queued.Task.Id)
+
 		if !c.isRunning {
-			// TODO Mark task as canceled and log
+			if hasP {
+				pending.resultChan <- ErrTaskCanceled
+			}
+
+			c.logger.Log(ctx, slog.LevelWarn, "client closed, canceling locally queued task",
+				"service", "streamfleet.Client",
+				"task_id", queued.Task.Id,
+				"task_notification_type", TaskNotificationTypeCanceled,
+			)
 			continue
 		}
 
-		pending, hasP := c.pendingTasks.Load(queued.Task.Id)
-
 		retry := func() {
-			if len(c.queuedTasks) >= cap(c.queuedTasks) {
-				// TODO Error, also putting reschedule error in task handle if present
-				// Log failure to requeue.
-				// Maybe even move this to a dedicated method.
-			} else {
-				c.queuedTasks <- queued
+			if !c.tryQueue(queued) {
+				// Failed to re-queue because the local queue was full.
+
+				if hasP {
+					pending.resultChan <- ErrClientQueueFull
+				}
+
+				c.logger.Log(ctx, slog.LevelError, "failed to put task on local queue in Redis, but could not put it back on the local queue because it was full",
+					"service", "streamfleet.Client",
+					"task_id", queued.Task.Id,
+					"error", ErrClientQueueFull,
+				)
 			}
 		}
 
@@ -222,7 +272,13 @@ func (c *Client) enqueueLoop() {
 				pending.resultChan <- ErrTaskExpired
 			}
 
-			// TODO Should I log here? Maybe have a setting about logging expired tasks?
+			c.logger.Log(ctx, slog.LevelWarn, "task expired before being sent to Redis",
+				"service", "streamfleet.Client",
+				"task_id", queued.Task.Id,
+				"error", ErrTaskExpired,
+			)
+
+			continue
 		}
 
 		err := c.client.XAdd(context.Background(), &redis.XAddArgs{
@@ -234,7 +290,11 @@ func (c *Client) enqueueLoop() {
 			// Consult Redis docs.
 		})
 		if err != nil {
-			// TODO Log error
+			c.logger.Log(ctx, slog.LevelError, "failed to sent locally queued task to Redis",
+				"service", "streamfleet.Client",
+				"task_id", queued.Task.Id,
+				"error", err,
+			)
 
 			retry()
 			continue
@@ -243,13 +303,14 @@ func (c *Client) enqueueLoop() {
 }
 
 // Listens for pending task notifications and notifies pending task handles.
-func (c *Client) notifSubscriber() {
+func (c *Client) notifLoop() {
 	ctx := context.Background()
 
 	// TODO Do trimming after receiving new messages (trim IDs below the one received)
 
+	stream := mkRecvStreamKey(c.id)
+
 	for c.isRunning {
-		stream := mkRecvStreamKey(c.id)
 		streamResults, err := c.client.XReadGroup(ctx, &redis.XReadGroupArgs{
 			Group:    clientGroupName,
 			Streams:  []string{stream},
@@ -259,8 +320,15 @@ func (c *Client) notifSubscriber() {
 		}).Result()
 		if err != nil {
 			// TODO If this is due to the stream or group not existing, recreate it and try again.
-			// TODO Log this
-			err = fmt.Errorf("streamfleet: server failed to read from Redis: %w", err)
+
+			c.logger.Log(ctx, slog.LevelError, "failed to receive task notifications from Redis",
+				"service", "streamfleet.Client",
+				"error", err,
+			)
+
+			// Wait a second before trying again.
+			time.Sleep(1 * time.Second)
+
 			continue
 		}
 
@@ -275,12 +343,17 @@ func (c *Client) notifSubscriber() {
 			var notif *TaskNotification
 			notif, err = decodeTaskNotification(msg.Values)
 			if err != nil {
-				// TODO Log error about failing to decode task notification
+				c.logger.Log(ctx, slog.LevelError, "failed to decode incoming task notification",
+					"service", "streamfleet.Client",
+					"client_id", c.id,
+					"error", err,
+				)
 				continue
 			}
 
 			pending, hasP := c.pendingTasks.LoadAndDelete(notif.TaskId)
 			if !hasP {
+				// No corresponding local task.
 				continue
 			}
 
@@ -294,7 +367,11 @@ func (c *Client) notifSubscriber() {
 			case TaskNotificationTypeError:
 				pending.resultChan <- fmt.Errorf(`streamfleet: task failed with error: %s`, notif.ErrMsg)
 			default:
-				// TODO Log unknown notification type
+				c.logger.Log(ctx, slog.LevelWarn, "received unknown task notification type",
+					"service", "streamfleet.Client",
+					"client_id", c.id,
+					"task_notification_type", notif.Type,
+				)
 			}
 		}
 
@@ -302,8 +379,12 @@ func (c *Client) notifSubscriber() {
 		lastMsg := msgs[len(msgs)-1]
 		err = c.client.XTrimMinID(ctx, stream, lastMsg.ID).Err()
 		if err != nil {
-			// TODO Log error
-			err = fmt.Errorf(`streamfleet: failed to trim stream to min ID %s: %w`, lastMsg.ID, err)
+			c.logger.Log(ctx, slog.LevelError, "failed to trim task notifications stream",
+				"service", "streamfleet.Client",
+				"client_id", c.id,
+				"stream", stream,
+				"last_msg_id", lastMsg.ID,
+			)
 			continue
 		}
 	}
@@ -325,8 +406,29 @@ func (c *Client) Close() error {
 		return true
 	})
 
+	// Delete receiver consumer group and stream.
+	ctx := context.Background()
+	recvKey := mkRecvStreamKey(c.id)
+	err := c.client.XGroupDestroy(ctx, recvKey, clientGroupName).Err()
+	if err != nil {
+		return fmt.Errorf(`streamfleet: failed to delete receiver consumer group %s for stream %s while closing client with ID %s: %w`, clientGroupName, recvKey, c.id, err)
+	}
+	err = c.client.Del(ctx, recvKey).Err()
+	if err != nil {
+		return fmt.Errorf(`streamfleet: failed to delete receiver stream %s while closing client with ID %s: %w`, stream, c.id, err)
+	}
+
+	// Delete heartbeat entries.
+	for queueKey := range c.queueToStream {
+		hbKey := mkRecvHeartbeatKey(queueKey)
+		err = c.client.ZRem(ctx, hbKey, c.id).Err()
+		if err != nil {
+			return fmt.Errorf(`streamfleet: failed to remove heartbeat entry for queue key %s while closing client with ID %s: %w`, queueKey, c.id, err)
+		}
+	}
+
 	// Finally, after everything has finished, close the Redis client.
-	if err := c.client.Close(); err != nil {
+	if err = c.client.Close(); err != nil {
 		return fmt.Errorf("streamfleet: failed to close Redis client while closing client: %w", err)
 	}
 

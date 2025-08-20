@@ -5,10 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"github.com/puzpuzpuz/xsync/v4"
+	"log/slog"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
+
+// TODO Periodically run GC
 
 // TODO Figure out a good way to trim the stream.
 // Right now my strategy is to use XDEL on old entries, but that doesn't work for crashed clients, and there might be more caveats.
@@ -48,7 +51,9 @@ type ServerOpt struct {
 	// If unspecified or <1, defaults to 1.
 	HandlerConcurrency int
 
-	// TODO Pluggable logger
+	// The logger to use.
+	// If omitted, uses slog.Default.
+	logger *slog.Logger
 }
 
 // Server is a work queue server (a worker).
@@ -79,6 +84,9 @@ type Server struct {
 	// A mapping of IDs of tasks that are currently in progress to their cancellation context.
 	// This is used to cancel tasks that are in progress.
 	inProgress *xsync.Map[string, context.CancelFunc]
+
+	// The logger to use.
+	logger *slog.Logger
 }
 
 // NewServer creates a new server instance.
@@ -90,6 +98,13 @@ func NewServer(opt ServerOpt) *Server {
 		opt.HandlerConcurrency = 1
 	}
 
+	var logger *slog.Logger
+	if opt.logger == nil {
+		logger = slog.Default()
+	} else {
+		logger = opt.logger
+	}
+
 	s := &Server{
 		isRunning:     false,
 		opt:           opt,
@@ -99,6 +114,7 @@ func NewServer(opt ServerOpt) *Server {
 		pendingTasks:  make(chan queuedTask, opt.HandlerConcurrency),
 		finishedChan:  make(chan struct{}, opt.HandlerConcurrency),
 		inProgress:    xsync.NewMap[string, context.CancelFunc](),
+		logger:        logger,
 	}
 
 	for range opt.HandlerConcurrency {
@@ -138,7 +154,11 @@ func (s *Server) procLoop() {
 
 		handler, hasHandler := s.queueHandlers[queued.Queue]
 		if !hasHandler {
-			// TODO Log error about receiving message for unknown queue, stating that it is a bug in the library
+			s.logger.Log(context.Background(), slog.LevelError, "received message from queue without a registered, this is a bug in streamfleet",
+				"service", "streamfleet.Server",
+				"server_id", s.opt.ServerUniqueId,
+				"queue", queued.Queue,
+			)
 			continue
 		}
 
@@ -166,7 +186,12 @@ func (s *Server) procLoop() {
 						Messages: []string{queued.Id},
 					}).Err()
 					if err != nil && !errors.Is(err, context.Canceled) {
-						// TODO Log error about failing to XCLAIM task
+						s.logger.Log(ctx, slog.LevelError, "failed to keep task in server custody with XCLAIM",
+							"service", "streamfleet.Server",
+							"server_id", s.opt.ServerUniqueId,
+							"task_id", queued.Task.Id,
+							"error", err,
+						)
 					}
 				case <-handlerDone:
 					timer.Stop()
@@ -179,13 +204,30 @@ func (s *Server) procLoop() {
 		err := handler(ctx, queued.Task)
 		handlerDone <- struct{}{}
 		if err != nil {
-			// TODO Log error about failing to handle task
 			// TODO Regardless of whether this was due to cancelation, abide by the retry policy.
 
 			if queued.Task.MaxRetries == 0 || queued.Task.retries < queued.Task.MaxRetries {
+				s.logger.Log(ctx, slog.LevelError, "task handler returned error, will retry",
+					"service", "streamfleet.Server",
+					"server_id", s.opt.ServerUniqueId,
+					"task_id", queued.Task.Id,
+					"error", err,
+					"retries", queued.Task.retries,
+					"max_retries", queued.Task.MaxRetries,
+					"will_retry", true,
+				)
+
 				// TODO Re-queue
 			} else {
-				// TODO Log that task failed too many times
+				s.logger.Log(ctx, slog.LevelError, "task handler returned error, will not retry",
+					"service", "streamfleet.Server",
+					"server_id", s.opt.ServerUniqueId,
+					"task_id", queued.Task.Id,
+					"error", err,
+					"retries", queued.Task.retries,
+					"max_retries", queued.Task.MaxRetries,
+					"will_retry", false,
+				)
 			}
 		}
 
@@ -193,14 +235,26 @@ func (s *Server) procLoop() {
 		// If it failed, it should have already had a duplicate added by this point.
 		err = s.client.XAck(context.Background(), queued.Stream, serverGroupName, queued.Id).Err()
 		if err != nil {
-			// TODO Log error about failing to acknowledge task.
+			s.logger.Log(ctx, slog.LevelError, "failed to acknowledge handled task",
+				"service", "streamfleet.Server",
+				"server_id", s.opt.ServerUniqueId,
+				"task_id", queued.Task.Id,
+				"error", err,
+			)
 
 			cleanup()
 			continue
 		}
+
+		// TODO Replace delete with trim?
 		err = s.client.XDel(context.Background(), queued.Stream, queued.Id).Err()
 		if err != nil {
-			// TODO Log error about failing to delete task.
+			s.logger.Log(ctx, slog.LevelError, "failed to delete handled task",
+				"service", "streamfleet.Server",
+				"server_id", s.opt.ServerUniqueId,
+				"task_id", queued.Task.Id,
+				"error", err,
+			)
 
 			cleanup()
 			continue
@@ -231,14 +285,18 @@ func (s *Server) recvLoop() error {
 		}).Result()
 		if err != nil {
 			// TODO Figure out if error can be ignored
-			return fmt.Errorf("streamfleet: server failed to read from Redis: %w", err)
+			return fmt.Errorf("streamfleet: server failed to read from Redis stream %s: %w", streamResults, err)
 		}
 
 		// For each stream, decode and queue all received tasks.
 		for _, result := range streamResults {
 			queue, hasQ := s.streamToQueue[result.Stream]
 			if !hasQ {
-				// TODO Log error about receiving message from unknown stream, stating that it is a bug in the library
+				s.logger.Log(ctx, slog.LevelError, "received message from unknown stream, this is a bug in streamfleet",
+					"service", "streamfleet.Server",
+					"server_id", s.opt.ServerUniqueId,
+					"stream", result.Stream,
+				)
 				continue
 			}
 
@@ -247,7 +305,13 @@ func (s *Server) recvLoop() error {
 				var task *Task
 				task, err = decodeTask(msg.Values)
 				if err != nil {
-					// TODO Log error about failing to decode task
+					s.logger.Log(ctx, slog.LevelError, "failed to decode incoming task",
+						"service", "streamfleet.Server",
+						"server_id", s.opt.ServerUniqueId,
+						"task_id", msg.ID,
+						"queue", queue,
+						"error", err,
+					)
 					continue
 				}
 
