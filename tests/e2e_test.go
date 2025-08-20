@@ -3,6 +3,7 @@ package tests
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/termermc/streamfleet"
 	"github.com/testcontainers/testcontainers-go"
@@ -10,6 +11,7 @@ import (
 	"math/rand/v2"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -51,7 +53,7 @@ func (d *dependencies) Close() {
 	_ = d.Container.Stop(context.Background(), nil)
 }
 
-func mkDeps() (*dependencies, error) {
+func mkDeps(opts ...any) (*dependencies, error) {
 	ctx := context.Background()
 	cont, redisAddr, err := prepareRedis(ctx)
 
@@ -59,21 +61,55 @@ func mkDeps() (*dependencies, error) {
 		return nil, fmt.Errorf("failed to start Redis container: %w", err)
 	}
 
-	redisOpt := streamfleet.RedisClientOpt{
-		Addr: redisAddr,
+	var redisOpt streamfleet.ToRedisClient
+	var clientOpt streamfleet.ClientOpt
+	var serverOpt streamfleet.ServerOpt
+	for _, optAny := range opts {
+		if rClientOpt, is := optAny.(streamfleet.RedisClientOpt); is {
+			if rClientOpt.Addr == "" {
+				rClientOpt.Addr = redisAddr
+			}
+			redisOpt = rClientOpt
+		} else if failoverClientOpt, is := optAny.(streamfleet.RedisClientOpt); is {
+			if failoverClientOpt.Addr == "" {
+				failoverClientOpt.Addr = redisAddr
+			}
+			redisOpt = failoverClientOpt
+		} else if clusterClientOpt, is := optAny.(streamfleet.RedisClusterClientOpt); is {
+			if clusterClientOpt.Addrs == nil {
+				clusterClientOpt.Addrs = []string{redisAddr}
+			}
+			redisOpt = clusterClientOpt
+		} else if theClientOpt, is := optAny.(streamfleet.ClientOpt); is {
+			clientOpt = theClientOpt
+		} else if theServerOpt, is := optAny.(streamfleet.ServerOpt); is {
+			serverOpt = theServerOpt
+		}
 	}
 
-	client, err := streamfleet.NewClient(ctx, streamfleet.ClientOpt{
-		RedisOpt: redisOpt,
-	}, TestQueue1)
+	if redisOpt == nil {
+		redisOpt = streamfleet.RedisClientOpt{
+			Addr: redisAddr,
+		}
+	}
+
+	if clientOpt.RedisOpt == nil {
+		clientOpt.RedisOpt = redisOpt
+	}
+
+	if serverOpt.ServerUniqueId == "" {
+		serverOpt.ServerUniqueId = "test.localhost"
+	}
+	if serverOpt.RedisOpt == nil {
+		serverOpt.RedisOpt = redisOpt
+	}
+
+	client, err := streamfleet.NewClient(ctx, clientOpt, TestQueue1)
 	if err != nil {
 		return nil, err
 	}
 
-	server, err := streamfleet.NewServer(streamfleet.ServerOpt{
-		ServerUniqueId: "test.localhost",
-		RedisOpt:       redisOpt,
-	})
+	server, err := streamfleet.NewServer(serverOpt)
 	if err != nil {
 		return nil, err
 	}
@@ -331,6 +367,152 @@ func TestPartiallyFailingTaskTracked(t *testing.T) {
 
 	if handlerCount != maxRetries {
 		t.Errorf(`handler was supposed to be called %d times, but it was called %d times`, maxRetries, handlerCount)
+	}
+
+	select {
+	case err = <-finChan:
+		t.Fatal(err)
+	default:
+	}
+}
+
+func TestConcurrentEnqueueAndTrack(t *testing.T) {
+	const taskSleep = 2 * time.Second
+	const concurrency = 4
+
+	d, err := mkDeps(streamfleet.ServerOpt{
+		HandlerConcurrency: concurrency,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	toSend := []string{"msg1", "msg2", "msg3", "msg4"}
+	recvLock := sync.Mutex{}
+	received := make(map[string]struct{}, len(toSend))
+	handles := make([]*streamfleet.TaskHandle, len(toSend))
+
+	for i, msg := range toSend {
+		handle, err := d.Client.EnqueueAndTrack(TestQueue1, msg, streamfleet.TaskOpt{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		handles[i] = handle
+	}
+
+	finChan := make(chan error, 1)
+
+	d.Server.Handle(TestQueue1, func(ctx context.Context, task *streamfleet.Task) error {
+		time.Sleep(taskSleep)
+
+		recvLock.Lock()
+		defer recvLock.Unlock()
+
+		_, has := received[task.Data]
+		if has {
+			return fmt.Errorf(`expected to only receive message with data "%s" once, but it is already in the map`, task.Data)
+		}
+
+		received[task.Data] = struct{}{}
+
+		return nil
+	})
+
+	go func() {
+		err = d.Server.Run()
+		if err != nil {
+			finChan <- err
+		}
+	}()
+
+	// Wait for task completion.
+	startTime := time.Now()
+	for _, handle := range handles {
+		err = handle.Wait()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	endTime := time.Now()
+	if endTime.Sub(startTime) > (taskSleep + (500 * time.Millisecond)) {
+		t.Errorf(`tasks took too long, it should have only taken the task sleep time, plus a padding of 500 milliseconds`)
+	}
+
+	// Check to make sure all messages were received.
+	for _, msg := range toSend {
+		if _, has := received[msg]; !has {
+			t.Errorf(`did not receive expected message "%s"`, msg)
+		}
+	}
+
+	select {
+	case err = <-finChan:
+		t.Fatal(err)
+	default:
+	}
+}
+
+func TestExpireTracked(t *testing.T) {
+	d, err := mkDeps()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	const taskSleep = 2 * time.Second
+
+	// Dummy task to cause handler to wait.
+	// Since by default the server has only 1 handler concurrency, this should hold up the other task.
+	err = d.Client.EnqueueAndForget(TestQueue1, "wait", streamfleet.TaskOpt{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Tasks with expiration times.
+	expTime1 := time.Now().Add(taskSleep)
+	handle1, err := d.Client.EnqueueAndTrack(TestQueue1, "can_expire", streamfleet.TaskOpt{
+		ExpiresTs: &expTime1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expTime2 := time.Now().Add(taskSleep + 1*time.Second)
+	handle2, err := d.Client.EnqueueAndTrack(TestQueue1, "can_expire", streamfleet.TaskOpt{
+		ExpiresTs: &expTime2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	finChan := make(chan error, 1)
+
+	d.Server.Handle(TestQueue1, func(ctx context.Context, task *streamfleet.Task) error {
+		if task.Data == "wait" {
+			time.Sleep(taskSleep)
+		}
+
+		return nil
+	})
+
+	go func() {
+		err = d.Server.Run()
+		if err != nil {
+			finChan <- err
+		}
+	}()
+
+	// Wait for task completions.
+	err = handle1.Wait()
+	if err == nil {
+		t.Errorf(`expected first task to fail`)
+	}
+	if !errors.Is(err, streamfleet.ErrTaskExpired) {
+		t.Errorf(`expected first task to fail because of expiration, instead got error: %s`, err.Error())
+	}
+	err = handle2.Wait()
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	select {

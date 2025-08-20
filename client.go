@@ -267,7 +267,7 @@ func (c *Client) enqueueLoop() {
 			}
 		}
 
-		if queued.Task.ExpiresTs != nil && queued.Task.ExpiresTs.After(time.Now()) {
+		if queued.Task.ExpiresTs != nil && time.Now().After(*queued.Task.ExpiresTs) {
 			if hasP {
 				pending.resultChan <- ErrTaskExpired
 			}

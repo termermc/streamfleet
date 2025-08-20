@@ -201,6 +201,7 @@ type TaskHandle struct {
 // Wait waits for the task to complete and returns the result.
 // Subsequent calls will return the same result.
 // If the task was canceled, the error will be ErrTaskCanceled.
+// If the task expired before being processed, the error will be ErrTaskExpired.
 //
 // Important: Do not call this method concurrently, otherwise it may panic.
 func (t *TaskHandle) Wait() error {
