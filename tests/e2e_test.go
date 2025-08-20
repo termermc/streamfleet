@@ -521,3 +521,51 @@ func TestExpireTracked(t *testing.T) {
 	default:
 	}
 }
+
+func TestDelayedServerStart(t *testing.T) {
+	d, err := mkDeps()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	const delay = 2 * time.Second
+
+	handle, err := d.Client.EnqueueAndTrack(TestQueue1, "hi", streamfleet.TaskOpt{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	finChan := make(chan error, 1)
+
+	d.Server.Handle(TestQueue1, func(ctx context.Context, task *streamfleet.Task) error {
+		return nil
+	})
+
+	go func() {
+		time.Sleep(delay)
+		err = d.Server.Run()
+		if err != nil {
+			finChan <- err
+		}
+	}()
+
+	// Wait for task completion.
+	startTime := time.Now()
+	err = handle.Wait()
+	endTime := time.Now()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	elapsed := endTime.Sub(startTime)
+	if elapsed > delay+(500*time.Millisecond) || elapsed < delay {
+		t.Errorf(`unexpected delay between enqueuing task and its completion, elapsed time was %s`, elapsed.String())
+	}
+
+	select {
+	case err = <-finChan:
+		t.Fatal(err)
+	default:
+	}
+}
