@@ -14,8 +14,6 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// TODO Periodically run GC
-
 // ErrClientQueueFull is returned when the client's queue is full.
 // This can be returned when enqueuing tasks, or be the logged error when a task is trying to be re-queued after an error.
 var ErrClientQueueFull = fmt.Errorf(`streamfleet: client queue is full, tasks are being enqueued too quickly to send to Redis, or Redis is unreachable`)
@@ -361,10 +359,6 @@ func (c *Client) enqueueLoop() {
 			err := c.client.XAdd(context.Background(), &redis.XAddArgs{
 				Stream: queued.Stream,
 				Values: queued.Task.encode(),
-
-				// TODO Should I use MAXLEN here?
-				// What other options are needed?
-				// Consult Redis docs.
 			}).Err()
 			if err != nil {
 				// Retry if it's due to a network error.
@@ -403,8 +397,6 @@ func (c *Client) enqueueLoop() {
 // Listens for pending task notifications and notifies pending task handles.
 func (c *Client) notifLoop() {
 	ctx := context.Background()
-
-	// TODO Do trimming after receiving new messages (trim IDs below the one received)
 
 	stream := mkRecvStreamKey(c.id)
 
