@@ -42,9 +42,15 @@ The overall design philosophy is to support queues with high error tolerance wit
 Many systems already have Redis, why not use its stream feature for reliable message delivery? No need to introduce a complex system like Kafka.
 As well as being fault-tolerance, the implementation aims to be as autonomous as possible. There are no features that rely on centralized coordination, other than Redis itself (which can be clustered for high-availability).
 
-## Examples
+## Use It
 
-To see all examples, visit the [examples](./examples) directory.
+To add the library to your project, run:
+
+```bash
+go get github.com/termermc/streamfleet
+```
+
+To see some examples, visit the [examples](./examples) directory.
 
 ### Simple Example
 
