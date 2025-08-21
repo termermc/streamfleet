@@ -523,20 +523,41 @@ func (s *Server) recvLoop() error {
 			streams = append(streams, stream, ">")
 		}
 
-		streamResults, err := s.client.XReadGroup(ctx, &redis.XReadGroupArgs{
-			Group:    serverGroupName,
-			Streams:  streams,
-			Consumer: s.opt.ServerUniqueId,
-			Block:    0,
-			Count:    int64(s.opt.HandlerConcurrency),
-		}).Result()
-		if err != nil {
-			if !s.isRunning || errors.Is(err, redis.ErrClosed) {
-				break
+		skipIter := false
+		var streamResults []redis.XStream
+		var err error
+		for s.isRunning {
+			streamResults, err = s.client.XReadGroup(ctx, &redis.XReadGroupArgs{
+				Group:    serverGroupName,
+				Streams:  streams,
+				Consumer: s.opt.ServerUniqueId,
+				Block:    0,
+				Count:    int64(s.opt.HandlerConcurrency),
+			}).Result()
+			if err != nil {
+				if !s.isRunning || errors.Is(err, redis.ErrClosed) {
+					skipIter = true
+					break
+				}
+
+				var opErr *net.OpError
+				if errors.As(err, &opErr) {
+					s.logger.Log(ctx, slog.LevelWarn, "failed to read tasks stream from Redis due to network error, will retry",
+						"service", "streamfleet.Server",
+						"server_id", s.opt.ServerUniqueId,
+						"error", err,
+					)
+					time.Sleep(1 * time.Second)
+					continue
+				}
+
+				return fmt.Errorf("streamfleet: server failed to read from Redis stream %s: %w", streamResults, err)
 			}
 
-			// TODO Figure out if error can be ignored
-			return fmt.Errorf("streamfleet: server failed to read from Redis stream %s: %w", streamResults, err)
+			break
+		}
+		if skipIter {
+			continue
 		}
 
 		// For each stream, decode and queue all received tasks.
