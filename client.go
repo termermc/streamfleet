@@ -151,7 +151,7 @@ func (c *Client) expiryLoop() {
 		}
 
 		c.pendingTasks.Range(func(id string, handle *TaskHandle) bool {
-			if handle.expTs != nil && time.Now().After(*handle.expTs) {
+			if !handle.expTs.IsZero() && time.Now().After(handle.expTs) {
 				c.pendingTasks.Delete(id)
 
 				// Try to send an expiry error.
@@ -303,7 +303,7 @@ func (c *Client) enqueueLoop() {
 			}
 		}
 
-		if queued.Task.ExpiresTs != nil && time.Now().After(*queued.Task.ExpiresTs) {
+		if !queued.Task.ExpiresTs.IsZero() && time.Now().After(queued.Task.ExpiresTs) {
 			if hasP {
 				pending.resultChan <- ErrTaskExpired
 			}

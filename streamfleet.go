@@ -42,11 +42,6 @@ var ErrTaskExpired = fmt.Errorf("streamfleet: task expired")
 // The only required field is Data.
 // Do not construct directly, use client enqueue methods.
 type Task struct {
-	// TODO Include a permanent random ID here.
-	// This is necessary because the underlying Redis message IDs might change when tasks are re-queued because of failures.
-	// We still need a stable ID to broadcast updates for.
-	// TODO Update server to make use of this ID instead of the stream message ID.
-
 	// The message's unique ID.
 	Id string
 
@@ -64,9 +59,9 @@ type Task struct {
 
 	// The timestamp when the task expires.
 	// If a worker receives the task past this timestamp, it will discard it, and optionally send a canceled signal.
-	// If not, never expires.
+	// If omitted, never expires.
 	// Precision below 1 second is not guaranteed to be enforced immediately by clients; it may take up to 1 second for expirations to be notified.
-	ExpiresTs *time.Time
+	ExpiresTs time.Time
 
 	// The duration to delay retrying the task.
 	RetryDelay time.Duration
@@ -89,8 +84,7 @@ type TaskOpt struct {
 	// The timestamp when the task expires.
 	// If a worker receives the task past this timestamp, it will discard it.
 	// If omitted, the task will never expire.
-	// TODO Make this not a pointer for better library ergonomics
-	ExpiresTs *time.Time
+	ExpiresTs time.Time
 
 	// The duration to delay retrying the task.
 	// If omitted, there is no delay.
@@ -112,7 +106,7 @@ func newTask(data string, clientId string, sendNotif bool, opt TaskOpt) *Task {
 
 func (t *Task) encode() map[string]any {
 	var expTs int64
-	if t.ExpiresTs != nil {
+	if !t.ExpiresTs.IsZero() {
 		expTs = t.ExpiresTs.UnixMilli()
 	}
 
@@ -164,10 +158,9 @@ func decodeTask(msg map[string]any) (*Task, error) {
 		fieldRetryDelay, _ := strconv.ParseInt(fieldRetryDelayStr, 10, 64)
 		fieldRetries, _ := strconv.ParseInt(fieldRetriesStr, 10, 64)
 
-		var expiresTs *time.Time
+		var expiresTs time.Time
 		if fieldExpiresTs != 0 {
-			ts := time.UnixMilli(fieldExpiresTs)
-			expiresTs = &ts
+			expiresTs = time.UnixMilli(fieldExpiresTs)
 		}
 
 		return &Task{
@@ -191,7 +184,7 @@ type TaskHandle struct {
 	// The task's unique ID.
 	Id string
 
-	expTs *time.Time
+	expTs time.Time
 
 	hasResult bool
 	result    error

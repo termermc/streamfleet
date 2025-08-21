@@ -248,7 +248,7 @@ func (s *Server) procLoop() {
 			continue
 		}
 
-		if queued.Task.ExpiresTs != nil && time.Now().After(*queued.Task.ExpiresTs) {
+		if !queued.Task.ExpiresTs.IsZero() && time.Now().After(queued.Task.ExpiresTs) {
 			if task.sendNotifications {
 				s.sendTaskNotif(queued.Task.ClientId, TaskNotification{
 					TaskId: queued.Task.Id,
