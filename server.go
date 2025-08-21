@@ -16,10 +16,10 @@ import (
 // TODO Figure out a good way to trim the stream.
 // Right now my strategy is to use XDEL on old entries, but that doesn't work for crashed clients, and there might be more caveats.
 
-// TODO Implement XAUTOCLAIM
-
 // The Redis stream group name used by servers to receive new messages.
 const serverGroupName = "streamfleet-server"
+
+const claimLoopInterval = 1 * time.Minute
 
 // TaskHandler is a function that handles a task.
 // Once it returns, the task will be acknowledged as complete if error is nil, otherwise it will be re-queued according to its retry policy.
@@ -143,6 +143,7 @@ func NewServer(opt ServerOpt) (*Server, error) {
 	}
 
 	go s.gcLoop()
+	go s.claimLoop()
 
 	return s, nil
 }
@@ -439,6 +440,76 @@ func (s *Server) procLoop() {
 		}
 
 		cleanup()
+	}
+}
+
+func (s *Server) claimLoop() {
+	ctx := context.Background()
+
+	for s.isRunning {
+		time.Sleep(claimLoopInterval)
+		if !s.isRunning {
+			break
+		}
+
+		for stream, queue := range s.streamToQueue {
+			var msgs []redis.XMessage
+			var cursor string
+			var err error
+
+			for cursor != "0-0" {
+				msgs, cursor, err = s.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+					Stream:  stream,
+					Start:   cursor,
+					MinIdle: TaskMaxPendingTime,
+				}).Result()
+				if err != nil {
+					// Retry if it's due to a network error.
+					var opErr *net.OpError
+					if errors.As(err, &opErr) {
+						s.logger.Log(ctx, slog.LevelWarn, "failed to run XAUTOCLAIM to claim idle tasks due to network error, will retry",
+							"service", "streamfleet.Server",
+							"server_id", s.opt.ServerUniqueId,
+							"cursor", cursor,
+							"error", err,
+						)
+						time.Sleep(1 * time.Second)
+						continue
+					}
+
+					s.logger.Log(ctx, slog.LevelError, "failed to run XAUTOCLAIM to claim idle tasks",
+						"service", "streamfleet.Server",
+						"server_id", s.opt.ServerUniqueId,
+						"cursor", cursor,
+						"error", err,
+					)
+
+					// Since the cursor will be "" if the command failed, continuing will just restart the iteration, which is what we want.
+					continue
+				}
+
+				for _, msg := range msgs {
+					task, err := decodeTask(msg.Values)
+					if err != nil {
+						s.logger.Log(ctx, slog.LevelError, "failed to decode incoming task",
+							"service", "streamfleet.Server",
+							"server_id", s.opt.ServerUniqueId,
+							"task_id", msg.ID,
+							"queue", queue,
+							"error", err,
+						)
+						continue
+					}
+
+					s.pendingTasks <- &queuedTask{
+						Stream:  stream,
+						Queue:   queue,
+						Task:    task,
+						RedisId: msg.ID,
+					}
+				}
+			}
+		}
 	}
 }
 
