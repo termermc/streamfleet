@@ -5,15 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/termermc/streamfleet"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
 	"math/rand/v2"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/termermc/streamfleet"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 const TestQueue1 = "test-queue-1"
@@ -109,7 +110,7 @@ func mkDeps(opts ...any) (*dependencies, error) {
 		return nil, err
 	}
 
-	server, err := streamfleet.NewServer(serverOpt)
+	server, err := streamfleet.NewServer(ctx, serverOpt)
 	if err != nil {
 		return nil, err
 	}
