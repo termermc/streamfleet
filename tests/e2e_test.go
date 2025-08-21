@@ -647,3 +647,52 @@ func TestRedisDisconnect(t *testing.T) {
 	default:
 	}
 }
+
+func TestClientTaskExpire(t *testing.T) {
+	d, err := mkDeps()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	const taskSleep = 5 * time.Second
+
+	expTime := time.Now().Add(3 * time.Second)
+	handle, err := d.Client.EnqueueAndTrack(TestQueue1, "hello", streamfleet.TaskOpt{
+		ExpiresTs: &expTime,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	finChan := make(chan error, 1)
+
+	d.Server.Handle(TestQueue1, func(ctx context.Context, task *streamfleet.Task) error {
+		// Wait longer than the expiration.
+		// The task is accepted before expiration, but it will expire client-side while it's sitting in the handler.
+		time.Sleep(taskSleep)
+		return nil
+	})
+
+	go func() {
+		err = d.Server.Run()
+		if err != nil {
+			finChan <- err
+		}
+	}()
+
+	// Wait for task completions.
+	err = handle.Wait()
+	if err == nil {
+		t.Errorf(`expected first task to fail`)
+	}
+	if !errors.Is(err, streamfleet.ErrTaskExpired) {
+		t.Errorf(`expected first task to fail because of expiration, instead got error: %s`, err.Error())
+	}
+
+	select {
+	case err = <-finChan:
+		t.Fatal(err)
+	default:
+	}
+}

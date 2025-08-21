@@ -65,6 +65,7 @@ type Task struct {
 	// The timestamp when the task expires.
 	// If a worker receives the task past this timestamp, it will discard it, and optionally send a canceled signal.
 	// If not, never expires.
+	// Precision below 1 second is not guaranteed to be enforced immediately by clients; it may take up to 1 second for expirations to be notified.
 	ExpiresTs *time.Time
 
 	// The duration to delay retrying the task.
@@ -188,6 +189,8 @@ func decodeTask(msg map[string]any) (*Task, error) {
 type TaskHandle struct {
 	// The task's unique ID.
 	Id string
+
+	expTs *time.Time
 
 	hasResult bool
 	result    error

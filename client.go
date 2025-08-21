@@ -16,14 +16,13 @@ import (
 
 // TODO Periodically run GC
 
-// TODO On the client side, enforce expiration for tracked tasks.
-// This means pending tasks should be failed with an expired error if a reply has not been received.
-
 // ErrClientQueueFull is returned when the client's queue is full.
 // This can be returned when enqueuing tasks, or be the logged error when a task is trying to be re-queued after an error.
 var ErrClientQueueFull = fmt.Errorf(`streamfleet: client queue is full, tasks are being enqueued too quickly to send to Redis, or Redis is unreachable`)
 
 const clientGroupName = "streamfleet-client"
+
+const expiryLoopInterval = 1 * time.Second
 
 // ClientOpt are options for Streamfleet clients.
 type ClientOpt struct {
@@ -32,11 +31,6 @@ type ClientOpt struct {
 	//
 	// Required.
 	RedisOpt ToRedisClient
-
-	// The timeout to use for reconnections to Redis in the event disconnection.
-	// If unspecified, there is no timeout and the server will attempt to reconnect forever.
-	// TODO Check if this is needed
-	RetryTimeout time.Duration
 
 	// The maximum number of tasks to queue locally in-memory while waiting for Redis to come back online.
 	// After the local queue has filled up, new tasks being queued will result in an error.
@@ -127,6 +121,7 @@ func NewClient(ctx context.Context, opt ClientOpt, queueKeys ...string) (*Client
 	}
 
 	go c.heartbeatLoop()
+	go c.expiryLoop()
 	go c.enqueueLoop()
 	go c.notifLoop()
 
@@ -146,6 +141,28 @@ func (c *Client) doHeartbeat(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (c *Client) expiryLoop() {
+	for c.isRunning {
+		time.Sleep(expiryLoopInterval)
+		if !c.isRunning {
+			break
+		}
+
+		c.pendingTasks.Range(func(id string, handle *TaskHandle) bool {
+			if handle.expTs != nil && time.Now().After(*handle.expTs) {
+				c.pendingTasks.Delete(id)
+
+				// Try to send an expiry error.
+				select {
+				case handle.resultChan <- ErrTaskExpired:
+				default:
+				}
+			}
+			return true
+		})
+	}
 }
 
 func (c *Client) heartbeatLoop() {
@@ -221,6 +238,7 @@ func (c *Client) EnqueueAndTrack(queueKey string, data string, opt TaskOpt) (*Ta
 	task := newTask(data, c.id, true, opt)
 	taskHandle := &TaskHandle{
 		Id:         task.Id,
+		expTs:      task.ExpiresTs,
 		resultChan: make(chan error, 1),
 	}
 	c.pendingTasks.Store(task.Id, taskHandle)
