@@ -4,11 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/puzpuzpuz/xsync/v4"
 	"log/slog"
 	"net"
 	"strings"
 	"time"
+
+	"github.com/puzpuzpuz/xsync/v4"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -97,7 +98,7 @@ type Server struct {
 
 // NewServer creates a new server instance.
 // It does not connect to Redis until Server.Run is called.
-func NewServer(opt ServerOpt) (*Server, error) {
+func NewServer(ctx context.Context, opt ServerOpt) (*Server, error) {
 	if opt.ServerUniqueId == "" {
 		return nil, ErrMissingServerUniqueId
 	}
