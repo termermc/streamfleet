@@ -618,7 +618,16 @@ func TestRedisDisconnect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	// Make sure client is capable of queuing locally before server comes online.
+	expTime := time.Now().Add(20 * time.Second)
+	newHandle, err := d.Client.EnqueueAndTrack(TestQueue1, "offline_enqueued", streamfleet.TaskOpt{
+		ExpiresTs: &expTime,
+	})
+	handles = append(handles, newHandle)
+
 	time.Sleep(1 * time.Second)
+
 	err = d.Container.Start(context.Background())
 	if err != nil {
 		t.Fatal(err)

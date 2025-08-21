@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"strings"
 	"time"
 
@@ -281,22 +282,45 @@ func (c *Client) enqueueLoop() {
 			continue
 		}
 
-		err := c.client.XAdd(context.Background(), &redis.XAddArgs{
-			Stream: queued.Stream,
-			Values: queued.Task.encode(),
+		skipIter := false
+		for c.isRunning {
+			err := c.client.XAdd(context.Background(), &redis.XAddArgs{
+				Stream: queued.Stream,
+				Values: queued.Task.encode(),
 
-			// TODO Should I use MAXLEN here?
-			// What other options are needed?
-			// Consult Redis docs.
-		}).Err()
-		if err != nil {
-			c.logger.Log(ctx, slog.LevelError, "failed to send locally queued task to Redis",
-				"service", "streamfleet.Client",
-				"task_id", queued.Task.Id,
-				"error", err,
-			)
+				// TODO Should I use MAXLEN here?
+				// What other options are needed?
+				// Consult Redis docs.
+			}).Err()
+			if err != nil {
+				// Retry if it's due to a network error.
+				var opErr *net.OpError
+				if errors.As(err, &opErr) {
+					c.logger.Log(ctx, slog.LevelWarn, "failed to send locally queued task due to network error, will retry",
+						"service", "streamfleet.Client",
+						"client_id", c.id,
+						"task_id", queued.Task.Id,
+						"stream", queued.Stream,
+						"error", err,
+					)
+					time.Sleep(1 * time.Second)
+					continue
+				}
 
-			retry()
+				c.logger.Log(ctx, slog.LevelError, "failed to send locally queued task to Redis",
+					"service", "streamfleet.Client",
+					"task_id", queued.Task.Id,
+					"error", err,
+				)
+
+				retry()
+				skipIter = true
+				break
+			}
+
+			break
+		}
+		if skipIter {
 			continue
 		}
 	}
