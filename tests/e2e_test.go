@@ -238,14 +238,14 @@ func TestFailingTaskTracked(t *testing.T) {
 	// Wait for task completion.
 	err = handle.Wait()
 	if err == nil {
-		t.Errorf("expected task to fail")
+		t.Fatalf("expected task to fail")
 	}
 	if !strings.Contains(err.Error(), "json fail") {
-		t.Errorf(`expected task error message to start with "json fail", but got: %s`, err.Error())
+		t.Fatalf(`expected task error message to start with "json fail", but got: %s`, err.Error())
 	}
 
 	if handlerCount != maxRetries+1 {
-		t.Errorf(`max retries was set to %d, so failing handler was supposed to be called %d times, but it was called %d times`, maxRetries, maxRetries+1, handlerCount)
+		t.Fatalf(`max retries was set to %d, so failing handler was supposed to be called %d times, but it was called %d times`, maxRetries, maxRetries+1, handlerCount)
 	}
 
 	select {
@@ -302,7 +302,7 @@ func TestFailingTaskForgotten(t *testing.T) {
 	time.Sleep(3 * time.Second)
 
 	if handlerCount != maxRetries+1 {
-		t.Errorf(`max retries was set to %d, so failing handler was supposed to be called %d times, but it was called %d times`, maxRetries, maxRetries+1, handlerCount)
+		t.Fatalf(`max retries was set to %d, so failing handler was supposed to be called %d times, but it was called %d times`, maxRetries, maxRetries+1, handlerCount)
 	}
 
 	select {
@@ -362,11 +362,11 @@ func TestPartiallyFailingTaskTracked(t *testing.T) {
 	// Wait for task completion.
 	err = handle.Wait()
 	if err != nil {
-		t.Errorf("task unexpectedly failed: %s", err.Error())
+		t.Fatalf("task unexpectedly failed: %s", err.Error())
 	}
 
 	if handlerCount != maxRetries {
-		t.Errorf(`handler was supposed to be called %d times, but it was called %d times`, maxRetries, handlerCount)
+		t.Fatalf(`handler was supposed to be called %d times, but it was called %d times`, maxRetries, handlerCount)
 	}
 
 	select {
@@ -436,13 +436,13 @@ func TestConcurrentEnqueueAndTrack(t *testing.T) {
 	}
 	endTime := time.Now()
 	if endTime.Sub(startTime) > (taskSleep + (500 * time.Millisecond)) {
-		t.Errorf(`tasks took too long, it should have only taken the task sleep time, plus a padding of 500 milliseconds`)
+		t.Fatalf(`tasks took too long, it should have only taken the task sleep time, plus a padding of 500 milliseconds`)
 	}
 
 	// Check to make sure all messages were received.
 	for _, msg := range toSend {
 		if _, has := received[msg]; !has {
-			t.Errorf(`did not receive expected message "%s"`, msg)
+			t.Fatalf(`did not receive expected message "%s"`, msg)
 		}
 	}
 
@@ -505,10 +505,10 @@ func TestExpireTracked(t *testing.T) {
 	// Wait for task completions.
 	err = handle1.Wait()
 	if err == nil {
-		t.Errorf(`expected first task to fail`)
+		t.Fatalf(`expected first task to fail`)
 	}
 	if !errors.Is(err, streamfleet.ErrTaskExpired) {
-		t.Errorf(`expected first task to fail because of expiration, instead got error: %s`, err.Error())
+		t.Fatalf(`expected first task to fail because of expiration, instead got error: %s`, err.Error())
 	}
 	err = handle2.Wait()
 	if err != nil {
@@ -560,7 +560,7 @@ func TestDelayedServerStart(t *testing.T) {
 
 	elapsed := endTime.Sub(startTime)
 	if elapsed > delay+(500*time.Millisecond) || elapsed < delay {
-		t.Errorf(`unexpected delay between enqueuing task and its completion, elapsed time was %s`, elapsed.String())
+		t.Fatalf(`unexpected delay between enqueuing task and its completion, elapsed time was %s`, elapsed.String())
 	}
 
 	select {
@@ -611,7 +611,7 @@ func TestRedisDisconnect(t *testing.T) {
 	time.Sleep(1_500 * time.Millisecond)
 
 	if handleCount != 1 {
-		t.Errorf(`expected to get 1 task done in 1.5 seconds`)
+		t.Fatalf(`expected to get 1 task done in 1.5 seconds`)
 	}
 
 	err = d.Container.Stop(context.Background(), nil)
@@ -684,15 +684,86 @@ func TestClientTaskExpire(t *testing.T) {
 	// Wait for task completions.
 	err = handle.Wait()
 	if err == nil {
-		t.Errorf(`expected first task to fail`)
+		t.Fatalf(`expected first task to fail`)
 	}
 	if !errors.Is(err, streamfleet.ErrTaskExpired) {
-		t.Errorf(`expected first task to fail because of expiration, instead got error: %s`, err.Error())
+		t.Fatalf(`expected first task to fail because of expiration, instead got error: %s`, err.Error())
 	}
 
 	select {
 	case err = <-finChan:
 		t.Fatal(err)
 	default:
+	}
+}
+
+func TestQueueOverflow(t *testing.T) {
+	const localQueueSize = 10
+
+	d, err := mkDeps(streamfleet.ClientOpt{
+		MaxLocalQueueSize: localQueueSize,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	err = d.Container.Terminate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1 * time.Second)
+
+	// Add +1 task because a task that's trying and failing to be sent to Redis will have been popped.
+	for range localQueueSize + 1 {
+		err = d.Client.EnqueueAndForget(TestQueue1, "test", streamfleet.TaskOpt{})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	err = d.Client.EnqueueAndForget(TestQueue1, "failing_task", streamfleet.TaskOpt{})
+	if err == nil {
+		t.Fatalf(`expected error but got none`)
+	}
+	if !errors.Is(err, streamfleet.ErrClientQueueFull) {
+		t.Fatalf(`expected ErrClientQueueFull, got: %s`, err.Error())
+	}
+}
+
+func TestClientCancelsOnClose(t *testing.T) {
+	d, err := mkDeps()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	const taskCount = 10
+
+	handles := make([]*streamfleet.TaskHandle, taskCount)
+	for i := range handles {
+		handle, err := d.Client.EnqueueAndTrack(TestQueue1, "task"+strconv.FormatInt(int64(i), 10), streamfleet.TaskOpt{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		handles[i] = handle
+	}
+
+	// Never run server so tasks never get completed.
+	// Close client before waiting for handles.
+	err = d.Client.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for task completions.
+	for _, handle := range handles {
+		err = handle.Wait()
+		if err == nil {
+			t.Fatalf(`expected error but got none`)
+		}
+		if !errors.Is(err, streamfleet.ErrTaskCanceled) {
+			t.Fatalf(`expected ErrTaskCanceled, got: %s`, err.Error())
+		}
 	}
 }

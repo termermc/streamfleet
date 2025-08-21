@@ -460,11 +460,14 @@ func (s *Server) recvLoop() error {
 					continue
 				}
 
-				s.pendingTasks <- &queuedTask{
-					Stream:  result.Stream,
-					Queue:   queue,
-					Task:    task,
-					RedisId: msg.ID,
+				// Guard to prevent send on closed channel.
+				if s.isRunning {
+					s.pendingTasks <- &queuedTask{
+						Stream:  result.Stream,
+						Queue:   queue,
+						Task:    task,
+						RedisId: msg.ID,
+					}
 				}
 			}
 		}
@@ -506,7 +509,12 @@ func (s *Server) Run() error {
 // Close stops the server.
 // Will cancel pending tasks and wait for processing loops to finish.
 // The server must not be used after calling Close.
+// Subsequent Close calls are no-op.
 func (s *Server) Close() error {
+	if !s.isRunning {
+		return nil
+	}
+
 	s.isRunning = false
 
 	close(s.pendingTasks)

@@ -187,6 +187,11 @@ func (c *Client) heartbeatLoop() {
 // tryQueue tries putting a task on the local queue.
 // If the queue is full, returns false. Otherwise, the task was queued and returns true.
 func (c *Client) tryQueue(q queuedTask) bool {
+	// Guard to prevent send on closed channel.
+	if !c.isRunning {
+		return false
+	}
+
 	select {
 	case c.queuedTasks <- q:
 		return true
@@ -201,6 +206,9 @@ var ErrUnsupportedQueueKey = fmt.Errorf(`streamfleet: unsupported queue key, cli
 // EnqueueAndForget adds a task to the queue and immediately returns.
 // Errors in queuing or the status of the task once it is picked up by a server are not tracked.
 // If you need to know when the task has been completed, use EnqueueAndTrack.
+//
+// If the number of locally queued tasks would exceed ClientOpt.MaxLocalQueueSize, returns ErrClientQueueFull.
+// This will normally only happen if the client cannot connect to Redis and tasks pile up.
 func (c *Client) EnqueueAndForget(queueKey string, data string, opt TaskOpt) error {
 	if !c.isRunning {
 		panic(fmt.Sprintf("streamfleet: tried to queue task on closed server (queueKey: %s)", queueKey))
@@ -212,10 +220,12 @@ func (c *Client) EnqueueAndForget(queueKey string, data string, opt TaskOpt) err
 
 	task := newTask(data, c.id, false, opt)
 
-	c.queuedTasks <- queuedTask{
+	if !c.tryQueue(queuedTask{
 		Stream: KeyPrefix + queueKey,
 		Queue:  queueKey,
 		Task:   task,
+	}) {
+		return ErrClientQueueFull
 	}
 
 	return nil
@@ -225,6 +235,9 @@ func (c *Client) EnqueueAndForget(queueKey string, data string, opt TaskOpt) err
 // Errors in queuing or the status of the task once it is picked up by the server can be tracked using the returned handle.
 // If you do not need to know when the task has been completed, use EnqueueAndForget.
 // You should only use this method if you need to know the status of the task, as it is less efficient than EnqueueAndForget.
+//
+// If the number of locally queued tasks would exceed ClientOpt.MaxLocalQueueSize, returns ErrClientQueueFull.
+// This will normally only happen if the client cannot connect to Redis and tasks pile up.
 func (c *Client) EnqueueAndTrack(queueKey string, data string, opt TaskOpt) (*TaskHandle, error) {
 	if !c.isRunning {
 		panic(fmt.Sprintf("streamfleet: tried to queue task on closed server (queueKey: %s)", queueKey))
@@ -241,11 +254,15 @@ func (c *Client) EnqueueAndTrack(queueKey string, data string, opt TaskOpt) (*Ta
 		expTs:      task.ExpiresTs,
 		resultChan: make(chan error, 1),
 	}
+
 	c.pendingTasks.Store(task.Id, taskHandle)
-	c.queuedTasks <- queuedTask{
+
+	if !c.tryQueue(queuedTask{
 		Stream: stream,
 		Queue:  queueKey,
 		Task:   task,
+	}) {
+		return nil, ErrClientQueueFull
 	}
 
 	return taskHandle, nil
@@ -474,7 +491,12 @@ func (c *Client) notifLoop() {
 // Close closes resources associated with the client.
 // Will cancel pending tasks. Locally queued tasks will be lost.
 // The client must not be used after calling Close.
+// Subsequent Close calls are no-op.
 func (c *Client) Close() error {
+	if !c.isRunning {
+		return nil
+	}
+
 	c.isRunning = false
 
 	close(c.queuedTasks)
@@ -490,13 +512,13 @@ func (c *Client) Close() error {
 	// Delete receiver stream and consumer group.
 	ctx := context.Background()
 	recvKey := mkRecvStreamKey(c.id)
-	err := c.client.Del(ctx, recvKey).Err()
-	if err != nil {
-		return fmt.Errorf(`streamfleet: failed to delete receiver stream %s while closing client with ID %s: %w`, recvKey, c.id, err)
-	}
-	err = c.client.XGroupDestroy(ctx, recvKey, clientGroupName).Err()
+	err := c.client.XGroupDestroy(ctx, recvKey, clientGroupName).Err()
 	if err != nil {
 		return fmt.Errorf(`streamfleet: failed to delete receiver consumer group %s for stream %s while closing client with ID %s: %w`, clientGroupName, recvKey, c.id, err)
+	}
+	err = c.client.Del(ctx, recvKey).Err()
+	if err != nil {
+		return fmt.Errorf(`streamfleet: failed to delete receiver stream %s while closing client with ID %s: %w`, recvKey, c.id, err)
 	}
 
 	// Delete heartbeat entries.

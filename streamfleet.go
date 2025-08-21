@@ -88,7 +88,8 @@ type TaskOpt struct {
 
 	// The timestamp when the task expires.
 	// If a worker receives the task past this timestamp, it will discard it.
-	// If omitted or nil, the task will never expire.
+	// If omitted, the task will never expire.
+	// TODO Make this not a pointer for better library ergonomics
 	ExpiresTs *time.Time
 
 	// The duration to delay retrying the task.
