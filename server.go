@@ -461,6 +461,7 @@ func (s *Server) claimLoop() {
 				msgs, cursor, err = s.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
 					Stream:  stream,
 					Start:   cursor,
+					Group:   serverGroupName,
 					MinIdle: TaskMaxPendingTime,
 				}).Result()
 				if err != nil {
