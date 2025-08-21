@@ -48,10 +48,6 @@ type ServerOpt struct {
 	// Required.
 	RedisOpt ToRedisClient
 
-	// The timeout to use for reconnections to Redis in the event disconnection.
-	// If unspecified, there is no timeout and the server will attempt to reconnect forever.
-	RetryTimeout time.Duration
-
 	// The number of concurrent handlers to run at once.
 	// If unspecified or <1, defaults to 1.
 	HandlerConcurrency int
