@@ -40,6 +40,11 @@ type ClientOpt struct {
 	// The logger to use.
 	// If omitted, uses slog.Default.
 	logger *slog.Logger
+
+	// The interval at which to run the receiver stream garbage collector.
+	// If omitted, defaults to DefaultReceiverStreamGcInterval.
+	// If you do not know what this is, you do not need to change it.
+	ReceiverStreamGcInterval time.Duration
 }
 
 // Client is a work queue client.
@@ -68,6 +73,9 @@ type Client struct {
 
 	// The logger to use.
 	logger *slog.Logger
+
+	// The interval at which to run the receiver stream GC.
+	recvGcInterval time.Duration
 }
 
 // NewClient creates a new client instance.
@@ -98,15 +106,20 @@ func NewClient(ctx context.Context, opt ClientOpt, queueKeys ...string) (*Client
 		logger = opt.logger
 	}
 
+	if opt.ReceiverStreamGcInterval == 0 {
+		opt.ReceiverStreamGcInterval = DefaultReceiverStreamGcInterval
+	}
+
 	c := &Client{
-		id:            id,
-		isRunning:     true,
-		opt:           opt,
-		queueToStream: queueToStream,
-		client:        client,
-		queuedTasks:   make(chan queuedTask, opt.MaxLocalQueueSize),
-		pendingTasks:  xsync.NewMap[string, *TaskHandle](),
-		logger:        logger,
+		id:             id,
+		isRunning:      true,
+		opt:            opt,
+		queueToStream:  queueToStream,
+		client:         client,
+		queuedTasks:    make(chan queuedTask, opt.MaxLocalQueueSize),
+		pendingTasks:   xsync.NewMap[string, *TaskHandle](),
+		logger:         logger,
+		recvGcInterval: receiverStreamHeartbeatInterval,
 	}
 
 	// Create stream and consumer group.
@@ -124,8 +137,34 @@ func NewClient(ctx context.Context, opt ClientOpt, queueKeys ...string) (*Client
 	go c.expiryLoop()
 	go c.enqueueLoop()
 	go c.notifLoop()
+	go c.gcLoop()
 
 	return c, nil
+}
+
+func (c *Client) gcLoop() {
+	ctx := context.Background()
+
+	queues := make([]string, 0, len(c.queueToStream))
+	for queue := range c.queueToStream {
+		queues = append(queues, queue)
+	}
+
+	for c.isRunning {
+		time.Sleep(c.recvGcInterval)
+		if !c.isRunning {
+			break
+		}
+
+		err := runReceiverStreamGc(ctx, c.client, queues)
+		if err != nil {
+			c.logger.Log(ctx, slog.LevelError, "failed to run receiver stream garbage collector",
+				"service", "streamfleet.Client",
+				"client_id", c.id,
+				"error", err,
+			)
+		}
+	}
 }
 
 func (c *Client) doHeartbeat(ctx context.Context) error {

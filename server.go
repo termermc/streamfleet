@@ -7,15 +7,16 @@ import (
 	"github.com/puzpuzpuz/xsync/v4"
 	"log/slog"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-// TODO Periodically run GC
-
 // TODO Figure out a good way to trim the stream.
 // Right now my strategy is to use XDEL on old entries, but that doesn't work for crashed clients, and there might be more caveats.
+
+// TODO Implement XAUTOCLAIM
 
 // The Redis stream group name used by servers to receive new messages.
 const serverGroupName = "streamfleet-server"
@@ -58,6 +59,11 @@ type ServerOpt struct {
 	// The logger to use.
 	// If omitted, uses slog.Default.
 	logger *slog.Logger
+
+	// The interval at which to run the receiver stream garbage collector.
+	// If omitted, defaults to DefaultReceiverStreamGcInterval.
+	// If you do not know what this is, you do not need to change it.
+	ReceiverStreamGcInterval time.Duration
 }
 
 // Server is a work queue server (a worker).
@@ -116,6 +122,10 @@ func NewServer(opt ServerOpt) (*Server, error) {
 		logger = opt.logger
 	}
 
+	if opt.ReceiverStreamGcInterval == 0 {
+		opt.ReceiverStreamGcInterval = DefaultReceiverStreamGcInterval
+	}
+
 	s := &Server{
 		isRunning:     false,
 		opt:           opt,
@@ -132,7 +142,34 @@ func NewServer(opt ServerOpt) (*Server, error) {
 		go s.procLoop()
 	}
 
+	go s.gcLoop()
+
 	return s, nil
+}
+
+func (s *Server) gcLoop() {
+	ctx := context.Background()
+
+	queues := make([]string, 0, len(s.streamToQueue))
+	for _, queue := range s.streamToQueue {
+		queues = append(queues, queue)
+	}
+
+	for s.isRunning {
+		time.Sleep(s.opt.ReceiverStreamGcInterval)
+		if !s.isRunning {
+			break
+		}
+
+		err := runReceiverStreamGc(ctx, s.client, queues)
+		if err != nil {
+			s.logger.Log(ctx, slog.LevelError, "failed to run receiver stream garbage collector",
+				"service", "streamfleet.Server",
+				"server_id", s.opt.ServerUniqueId,
+				"error", err,
+			)
+		}
+	}
 }
 
 // Handle sets the handler for the queue with the specified key.
@@ -489,7 +526,11 @@ func (s *Server) Run() error {
 	for stream := range s.streamToQueue {
 		err := s.client.XGroupCreateMkStream(ctx, stream, serverGroupName, "0").Err()
 		if err != nil {
-			// TODO Ignore BUSYGROUP errors
+			// Ignore BUSYGROUP errors.
+			if strings.Contains(err.Error(), "BUSYGROUP") {
+				continue
+			}
+
 			return fmt.Errorf("streamfleet: failed to create stream %s or group %s for the stream: %w", stream, serverGroupName, err)
 		}
 	}

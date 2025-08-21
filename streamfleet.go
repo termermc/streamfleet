@@ -10,6 +10,10 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// DefaultReceiverStreamGcInterval is the default interval at which receiver stream garbage collections are run.
+// This applies to clients and servers if no specific interval is set.
+const DefaultReceiverStreamGcInterval = 1 * time.Minute
+
 // The current encoding version used for encoding tasks in Redis stream messages.
 const curTaskEncVer = "1"
 

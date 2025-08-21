@@ -470,16 +470,14 @@ func TestExpireTracked(t *testing.T) {
 	}
 
 	// Tasks with expiration times.
-	expTime1 := time.Now().Add(taskSleep)
 	handle1, err := d.Client.EnqueueAndTrack(TestQueue1, "can_expire", streamfleet.TaskOpt{
-		ExpiresTs: &expTime1,
+		ExpiresTs: time.Now().Add(taskSleep),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	expTime2 := time.Now().Add(taskSleep + 1*time.Second)
 	handle2, err := d.Client.EnqueueAndTrack(TestQueue1, "can_expire", streamfleet.TaskOpt{
-		ExpiresTs: &expTime2,
+		ExpiresTs: time.Now().Add(taskSleep + 1*time.Second),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -582,9 +580,8 @@ func TestRedisDisconnect(t *testing.T) {
 
 	handles := make([]*streamfleet.TaskHandle, taskCount)
 	for i := range handles {
-		expTime := time.Now().Add(20 * time.Second)
 		handle, err := d.Client.EnqueueAndTrack(TestQueue1, "task"+strconv.FormatInt(int64(i), 10), streamfleet.TaskOpt{
-			ExpiresTs: &expTime,
+			ExpiresTs: time.Now().Add(20 * time.Second),
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -620,9 +617,8 @@ func TestRedisDisconnect(t *testing.T) {
 	}
 
 	// Make sure client is capable of queuing locally before server comes online.
-	expTime := time.Now().Add(20 * time.Second)
 	newHandle, err := d.Client.EnqueueAndTrack(TestQueue1, "offline_enqueued", streamfleet.TaskOpt{
-		ExpiresTs: &expTime,
+		ExpiresTs: time.Now().Add(20 * time.Second),
 	})
 	handles = append(handles, newHandle)
 
@@ -657,9 +653,8 @@ func TestClientTaskExpire(t *testing.T) {
 
 	const taskSleep = 5 * time.Second
 
-	expTime := time.Now().Add(3 * time.Second)
 	handle, err := d.Client.EnqueueAndTrack(TestQueue1, "hello", streamfleet.TaskOpt{
-		ExpiresTs: &expTime,
+		ExpiresTs: time.Now().Add(3 * time.Second),
 	})
 	if err != nil {
 		t.Fatal(err)
