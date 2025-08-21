@@ -584,6 +584,8 @@ func (s *Server) recvLoop() error {
 // Run runs the server.
 // It will only return if the server's initial connection fails, or retrying the connection times out.
 // Note that handlers are not guaranteed to run on the same goroutine as this call.
+//
+// Since this method will run for the duration of the server's life, it blocks and should usually be run in its own goroutine.
 func (s *Server) Run() error {
 	ctx := context.Background()
 
