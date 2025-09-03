@@ -14,7 +14,7 @@ Completion can be optionally tracked.
 
 ## Architecture
 
-The application is broken up into two components, coordinated by Redis:
+The library is broken up into two components, coordinated by Redis:
 
  - The client, which submits (enqueues) tasks to the queue.
     	
