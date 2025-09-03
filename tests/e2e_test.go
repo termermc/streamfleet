@@ -763,3 +763,66 @@ func TestClientCancelsOnClose(t *testing.T) {
 		}
 	}
 }
+
+func TestDelayedRetry(t *testing.T) {
+	d, err := mkDeps()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	const delay = 2 * time.Second
+	const maxRetries = 2
+
+	startTime := time.Now()
+	handle, err := d.Client.EnqueueAndTrack(TestQueue1, "hi", streamfleet.TaskOpt{
+		RetryDelay: delay,
+		MaxRetries: maxRetries,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	finChan := make(chan error, 1)
+
+	throwErr := errors.New("failed for some reason")
+
+	handlerCount := 0
+	d.Server.Handle(TestQueue1, func(ctx context.Context, task *streamfleet.Task) error {
+		handlerCount++
+		return throwErr
+	})
+
+	go func() {
+		err = d.Server.Run()
+		if err != nil {
+			finChan <- err
+		}
+	}()
+
+	// Wait for task completion.
+	err = handle.Wait()
+	if err == nil {
+		t.Fatalf("expected task to fail")
+	}
+	if !strings.Contains(err.Error(), throwErr.Error()) {
+		t.Fatalf(`expected task error message to include "%s", but got: %s`, throwErr.Error(), err.Error())
+	}
+
+	endTime := time.Now()
+
+	totalDelay := endTime.Sub(startTime)
+	if totalDelay < delay*maxRetries {
+		t.Fatalf(`expected task to take delay * maxRetries to fail, but took less time`)
+	}
+
+	if handlerCount != maxRetries+1 {
+		t.Fatalf(`max retries was set to %d, so failing handler was supposed to be called %d times, but it was called %d times`, maxRetries, maxRetries+1, handlerCount)
+	}
+
+	select {
+	case err = <-finChan:
+		t.Fatal(err)
+	default:
+	}
+}
