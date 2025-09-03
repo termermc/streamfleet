@@ -1,46 +1,60 @@
 # streamfleet
 
-Customizable Go work queue implementation backed by Redis Streams (or Valkey Streams). No Lua or fancy tricks required.
+Customizable Go work queue implementation backed by Redis Streams (or Valkey
+Streams). No Lua or fancy tricks required.
 
-Tasks placed on the queue are processed once by the worker that can pick up the task quickest.
-Completion can be optionally tracked.
+Tasks placed on the queue are processed once by the worker that can pick up the
+task quickest. Completion can be optionally tracked.
 
 ## Features
 
- - Optional task completion notifications
- - Support for Redis Sentinel and Cluster
- - Automatic retry and worker crash recovery
- - Tolerance for Redis downtime without data loss
+- Optional task completion notifications
+- Support for Redis Sentinel and Cluster
+- Automatic retry and worker crash recovery
+- Tolerance for Redis downtime without data loss
 
 ## Architecture
 
 The library is broken up into two components, coordinated by Redis:
 
- - The client, which submits (enqueues) tasks to the queue.
-    	
-   Clients can optionally track completion or failure of tasks by listening for notifications about them.
-   Whether to send completion notifications is sent along with the task.
+- The client, which submits (enqueues) tasks to the queue.
 
- - The server (worker), which accepts work from the queue and processes it.
+  Clients can optionally track completion or failure of tasks by listening for
+  notifications about them. Whether to send completion notifications is sent
+  along with the task.
 
-   In addition to receiving new tasks, workers can claim tasks that have sat idle too long in other workers' pending lists.
-   Long-running tasks are kept fresh and not in an idle state as long as the task is pending in the functional server.
-   Only servers that have crashed or are unresponsive would have their tasks reclaimed.
+- The server (worker), which accepts work from the queue and processes it.
 
-   If a task fails while the worker is running, the server will put the task back on the queue and increment its failure count.
+  In addition to receiving new tasks, workers can claim tasks that have sat idle
+  too long in other workers' pending lists. Long-running tasks are kept fresh
+  and not in an idle state as long as the task is pending in the functional
+  server. Only servers that have crashed or are unresponsive would have their
+  tasks reclaimed.
 
-Note that servers and clients may exist on the same process; they do not need to be in separate microservices.
+  If a task fails while the worker is running, the server will put the task back
+  on the queue and increment its failure count.
 
-Task notifications are sent over a client-specific stream for reliable delivery, even if there is temporary disconnection from Redis.
-Clients clean up these streams when their Close method is called to avoid resource leaks.
-In the event that they are not closed cleanly, other clients and servers use a simple garbage collector based on client heartbeats to find orphaned client streams and delete them.
+Note that servers and clients may exist on the same process; they do not need to
+be in separate microservices.
 
-If the underlying Redis server is unavailable, the clients will wait until it comes back online.
-Tasks submitted to the client stay queued in-memory until Redis is available.
+Task notifications are sent over a client-specific stream for reliable delivery,
+even if there is temporary disconnection from Redis. Clients clean up these
+streams when their Close method is called to avoid resource leaks. In the event
+that they are not closed cleanly, other clients and servers use a simple garbage
+collector based on client heartbeats to find orphaned client streams and delete
+them.
 
-The overall design philosophy is to support queues with high error tolerance without losing anything, and to have as few moving parts as possible.
-Many systems already have Redis, why not use its stream feature for reliable message delivery? No need to introduce a complex system like Kafka.
-As well as being fault-tolerance, the implementation aims to be as autonomous as possible. There are no features that rely on centralized coordination, other than Redis itself (which can be clustered for high-availability).
+If the underlying Redis server is unavailable, the clients will wait until it
+comes back online. Tasks submitted to the client stay queued in-memory until
+Redis is available.
+
+The overall design philosophy is to support queues with high error tolerance
+without losing anything, and to have as few moving parts as possible. Many
+systems already have Redis, why not use its stream feature for reliable message
+delivery? No need to introduce a complex system like Kafka. As well as being
+fault-tolerance, the implementation aims to be as autonomous as possible. There
+are no features that rely on centralized coordination, other than Redis itself
+(which can be clustered for high-availability).
 
 ## Use It
 
