@@ -223,8 +223,10 @@ func (s *Server) sendTaskNotif(clientId string, notif TaskNotification) {
 	}
 }
 
-func (s *Server) retry(ctx context.Context, queued *queuedTask, cause error) {
+func (s *Server) retry(queued *queuedTask, cause error) {
 	go func() {
+		ctx := context.Background()
+
 		task := queued.Task
 
 		time.Sleep(task.RetryDelay)
@@ -357,7 +359,7 @@ func (s *Server) procLoop() {
 				)
 
 				// Try to re-queue.
-				s.retry(ctx, queued, err)
+				s.retry(queued, err)
 			} else {
 				s.logger.Log(ctx, slog.LevelError, "task handler returned error, will not retry",
 					"service", "streamfleet.Server",
